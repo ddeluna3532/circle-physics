@@ -1,0 +1,260 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --panel-width: 200px;
+  --panel-bg: #2a2a2a;
+  --panel-border: #3a3a3a;
+  --text-color: #e0e0e0;
+  --text-muted: #888;
+  --accent: #5a9fcf;
+  --canvas-bg: #ebe0cc;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  background: #1a1a1a;
+  color: var(--text-color);
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Panels */
+.panel {
+  width: var(--panel-width);
+  background: var(--panel-bg);
+  border-color: var(--panel-border);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.left-panel {
+  border-right: 1px solid var(--panel-border);
+}
+
+.right-panel {
+  border-left: 1px solid var(--panel-border);
+}
+
+.panel h2 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+.panel h2:first-child {
+  margin-top: 0;
+}
+
+/* Control groups */
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.control-group.button-row {
+  flex-direction: row;
+  gap: 8px;
+}
+
+.control-group.button-row button {
+  flex: 1;
+}
+
+.button-row {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.button-row button {
+  flex: 1;
+}
+
+.control-group label {
+  font-size: 13px;
+  color: var(--text-color);
+}
+
+/* Buttons */
+button {
+  background: #3a3a3a;
+  border: 1px solid #4a4a4a;
+  color: var(--text-color);
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+button:hover {
+  background: #4a4a4a;
+  border-color: #5a5a5a;
+}
+
+button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+button.active.danger {
+  background: #c0392b;
+  border-color: #c0392b;
+}
+
+button.active.warning {
+  background: #d68910;
+  border-color: #d68910;
+}
+
+button.active.info {
+  background: #8e44ad;
+  border-color: #8e44ad;
+}
+
+/* Sliders */
+input[type="range"] {
+  width: 100%;
+  height: 4px;
+  -webkit-appearance: none;
+  background: #4a4a4a;
+  border-radius: 2px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+/* Canvas container */
+.canvas-container {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1a1a1a;
+}
+
+.canvas-container canvas {
+  background: var(--canvas-bg);
+  border-radius: 4px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  max-width: 100%;
+  max-height: 100%;
+  touch-action: none; /* Prevent default touch behaviors */
+}
+
+/* Placeholder text */
+.placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 12px;
+}
+
+/* Color preview swatch */
+.color-preview {
+  width: 100%;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid #4a4a4a;
+}
+
+/* Swatch row */
+.swatch-row {
+  display: flex;
+  gap: 8px;
+}
+
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform 0.1s, border-color 0.1s;
+}
+
+.swatch:hover {
+  transform: scale(1.1);
+}
+
+.swatch.selected {
+  border-color: white;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
+}
+
+/* Spring-loaded slider */
+.spring-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spring-slider input[type="range"] {
+  flex: 1;
+}
+
+.spring-slider .slider-label {
+  font-size: 18px;
+  font-weight: bold;
+  color: #888;
+  width: 16px;
+  text-align: center;
+}
+
+/* Hold button */
+button.hold-button {
+  background: #2d5a3d;
+  border-color: #2d5a3d;
+}
+
+button.hold-button:hover {
+  background: #3d7a4d;
+  border-color: #3d7a4d;
+}
+
+button.hold-button:active {
+  background: #4d9a5d;
+  border-color: #4d9a5d;
+}
+
+/* Aspect ratio input */
+.aspect-input {
+  background: #3a3a3a;
+  border: 1px solid #4a4a4a;
+  border-radius: 4px;
+  color: #e0e0e0;
+  padding: 6px 10px;
+  font-size: 14px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.aspect-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}

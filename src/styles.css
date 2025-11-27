@@ -258,3 +258,143 @@ button.hold-button:active {
   outline: none;
   border-color: var(--accent);
 }
+
+/* Layer panel */
+.layer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.layer-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  background: #3a3a3a;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 2px solid transparent;
+}
+
+.layer-item.active {
+  border-color: var(--accent);
+  background: #404040;
+}
+
+.layer-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.layer-type {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.layer-name {
+  font-size: 12px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.layer-btn {
+  background: #4a4a4a;
+  border: none;
+  border-radius: 3px;
+  color: #e0e0e0;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  min-width: 22px;
+}
+
+.layer-btn:hover {
+  background: #5a5a5a;
+}
+
+.layer-btn.off {
+  opacity: 0.4;
+}
+
+.layer-btn.on {
+  background: var(--accent);
+}
+
+.layer-btn.danger:hover {
+  background: #c0392b;
+}
+
+/* Layer opacity slider */
+.layer-opacity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.layer-opacity .opacity-label {
+  font-size: 10px;
+  color: #888;
+  width: 12px;
+}
+
+.layer-opacity input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #4a4a4a;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.layer-opacity input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.layer-opacity input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+
+/* Selection actions */
+.selection-actions {
+  background: rgba(0, 120, 255, 0.1);
+  border: 1px solid rgba(0, 120, 255, 0.3);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.selection-actions label {
+  color: #4a9eff;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.selection-actions .button-row {
+  gap: 6px;
+}
+
+.selection-actions button {
+  padding: 6px 10px;
+  font-size: 12px;
+}

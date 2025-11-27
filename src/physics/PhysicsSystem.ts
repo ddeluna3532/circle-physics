@@ -9,6 +9,10 @@ export class PhysicsSystem {
   // Flow field settings
   flowStrength: number = 0.15;
   flowRadius: number = 100;
+  
+  // Callback to check if a circle should be affected by physics
+  // Can be overridden to include layer lock checks
+  isAffected: (c: Circle) => boolean = (c) => !c.locked && !c.isDragging;
 
   constructor() {
     this.config = {
@@ -20,6 +24,10 @@ export class PhysicsSystem {
       damping: 0.94,
     };
     this.bounds = { x: 0, y: 0, width: 800, height: 600 };
+  }
+  
+  setAffectedCheck(fn: (c: Circle) => boolean): void {
+    this.isAffected = fn;
   }
 
   setBounds(x: number, y: number, width: number, height: number) {
@@ -55,7 +63,7 @@ export class PhysicsSystem {
 
   applyFlowField(): void {
     for (const c of this.circles) {
-      if (c.locked || c.isDragging) continue;
+      if (!this.isAffected(c)) continue;
       
       for (const fv of this.flowVectors) {
         const dx = c.x - fv.x;
@@ -118,7 +126,7 @@ export class PhysicsSystem {
     if (!this.config.gravityEnabled) return;
 
     for (const c of this.circles) {
-      if (c.locked || c.isDragging) continue;
+      if (!this.isAffected(c)) continue;
       // Smaller circles fall faster (less air resistance feel)
       const gravityAccel = (2.0 * this.config.gravityStrength) / Math.max(c.r, 1);
       c.vy += gravityAccel;
@@ -128,8 +136,14 @@ export class PhysicsSystem {
   private handleOverlaps(): void {
     for (let i = 0; i < this.circles.length; i++) {
       const a = this.circles[i];
+      const aAffected = this.isAffected(a);
+      
       for (let j = i + 1; j < this.circles.length; j++) {
         const b = this.circles[j];
+        const bAffected = this.isAffected(b);
+        
+        // Skip if neither can be affected
+        if (!aAffected && !bAffected) continue;
 
         const dx = b.x - a.x;
         const dy = b.y - a.y;
@@ -143,11 +157,11 @@ export class PhysicsSystem {
           const pushStrength = 0.5;
           const totalMass = a.mass + b.mass;
 
-          if (!a.locked && !a.isDragging) {
+          if (aAffected) {
             a.vx -= nx * overlap * pushStrength * (b.mass / totalMass);
             a.vy -= ny * overlap * pushStrength * (b.mass / totalMass);
           }
-          if (!b.locked && !b.isDragging) {
+          if (bAffected) {
             b.vx += nx * overlap * pushStrength * (a.mass / totalMass);
             b.vy += ny * overlap * pushStrength * (a.mass / totalMass);
           }
@@ -158,7 +172,7 @@ export class PhysicsSystem {
 
   private updatePositions(): void {
     for (const c of this.circles) {
-      if (c.locked || c.isDragging) continue;
+      if (!this.isAffected(c)) continue;
 
       c.vx *= this.config.damping;
       c.vy *= this.config.damping;
@@ -173,7 +187,7 @@ export class PhysicsSystem {
     const bounce = -0.6;
 
     for (const c of this.circles) {
-      if (c.locked || c.isDragging) continue;
+      if (!this.isAffected(c)) continue;
 
       // Floor
       if (this.config.floorEnabled && c.y + c.r > this.config.floorY) {

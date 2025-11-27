@@ -9,7 +9,7 @@ export interface Circle {
   color: string;
   isDragging: boolean;
   locked: boolean;
-  layerId: number;
+  layerId: string;
 }
 
 export interface FlowVector {
@@ -32,7 +32,8 @@ export function createCircle(
   x: number,
   y: number,
   r: number,
-  color: string
+  color: string,
+  layerId: string = ''
 ): Circle {
   return {
     id: Math.random(),
@@ -45,7 +46,7 @@ export function createCircle(
     color,
     isDragging: false,
     locked: false,
-    layerId: 0,
+    layerId,
   };
 }
 

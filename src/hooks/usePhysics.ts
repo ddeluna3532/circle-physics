@@ -11,8 +11,8 @@ export function usePhysics() {
   const system = systemRef.current;
 
   const addCircle = useCallback(
-    (x: number, y: number, r: number, color: string): boolean => {
-      const circle = createCircle(x, y, r, color);
+    (x: number, y: number, r: number, color: string, layerId: string = ''): boolean => {
+      const circle = createCircle(x, y, r, color, layerId);
       const added = system.addCircle(circle);
       if (added) {
         setCircleCount(system.circles.length);

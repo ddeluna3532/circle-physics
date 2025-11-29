@@ -25,6 +25,8 @@ export interface ProjectData {
     floorY: number;
     wallsEnabled: boolean;
     damping: number;
+    collisionIterations?: number;
+    restitution?: number;
   };
   
   // Other settings
@@ -39,6 +41,10 @@ export interface ProjectData {
   // Color palette
   palette: { h: number; s: number; l: number }[];
   selectedSwatch: number;
+  
+  // Background palette
+  bgPalette?: { h: number; s: number; l: number }[];
+  selectedBgSwatch?: number;
 }
 
 // Simplified circle for JSON (no functions, no refs)
@@ -122,6 +128,8 @@ export function saveProject(
   settings: ProjectData['settings'],
   palette: ProjectData['palette'],
   selectedSwatch: number,
+  bgPalette: ProjectData['bgPalette'],
+  selectedBgSwatch: number,
   projectName: string = 'untitled'
 ): void {
   const project: ProjectData = {
@@ -136,6 +144,8 @@ export function saveProject(
     settings,
     palette,
     selectedSwatch,
+    bgPalette,
+    selectedBgSwatch,
   };
   
   const json = JSON.stringify(project, null, 2);

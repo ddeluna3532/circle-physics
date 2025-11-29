@@ -1,14 +1,16 @@
 import { Circle } from '../physics';
-import { Layer, PaintLayer } from './types';
+import { Layer } from './types';
 
 export interface SVGExportOptions {
   backgroundColor: string;
   stencilMargin: number; // margin between circles for stencil cutting
+  includeStencilLayers: boolean; // whether to include stencil separation layers
 }
 
 const defaultOptions: SVGExportOptions = {
   backgroundColor: '#ebe0cc',
   stencilMargin: 10,
+  includeStencilLayers: true,
 };
 
 // Convert HSL color string to hex
@@ -51,99 +53,44 @@ function circlesOverlapWithMargin(a: Circle, b: Circle, margin: number): boolean
   return dist < minDist;
 }
 
-// Generate SVG content for a set of circles
-function generateSVGContent(
-  circles: Circle[],
-  width: number,
-  height: number,
-  layers: Layer[],
-  options: SVGExportOptions
-): string {
-  let svg = `<?xml version="1.0" standalone="no"?>\n`;
-  svg += `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" version="1.1">\n`;
-  svg += `  <rect x="0" y="0" width="${width}" height="${height}" fill="${options.backgroundColor}"/>\n`;
+// Separate circles into non-overlapping stencil layers
+function computeStencilLayers(circles: Circle[], margin: number): Circle[][] {
+  let circlesToProcess = [...circles];
+  const stencilLayers: Circle[][] = [];
   
-  // Group circles by layer and render in layer order
-  for (const layer of layers) {
-    if (layer.type !== 'circles' || !layer.visible) continue;
+  while (circlesToProcess.length > 0) {
+    const currentLayer: Circle[] = [];
     
-    const layerCircles = circles.filter(c => c.layerId === layer.id);
-    
-    if (layerCircles.length === 0) continue;
-    
-    // Add layer group with opacity
-    if (layer.opacity < 1) {
-      svg += `  <g opacity="${layer.opacity.toFixed(3)}">\n`;
-    }
-    
-    for (const c of layerCircles) {
-      if (!circleIntersectsCanvas(c, width, height)) continue;
+    for (let i = circlesToProcess.length - 1; i >= 0; i--) {
+      const candidate = circlesToProcess[i];
+      let canPlace = true;
       
-      const hexColor = hslToHex(c.color);
-      svg += `    <circle cx="${c.x.toFixed(2)}" cy="${c.y.toFixed(2)}" r="${c.r.toFixed(2)}" fill="${hexColor}" stroke="none"/>\n`;
+      for (const placed of currentLayer) {
+        if (circlesOverlapWithMargin(candidate, placed, margin)) {
+          canPlace = false;
+          break;
+        }
+      }
+      
+      if (canPlace) {
+        currentLayer.push(candidate);
+        circlesToProcess.splice(i, 1);
+      }
     }
     
-    if (layer.opacity < 1) {
-      svg += `  </g>\n`;
+    if (currentLayer.length > 0) {
+      stencilLayers.push(currentLayer);
+    } else {
+      break;
     }
   }
   
-  svg += `</svg>\n`;
-  return svg;
+  return stencilLayers;
 }
 
-// Generate SVG for a single stencil layer
-function generateStencilLayerSVG(
-  circles: Circle[],
-  width: number,
-  height: number,
-  options: SVGExportOptions
-): string {
-  let svg = `<?xml version="1.0" standalone="no"?>\n`;
-  svg += `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" version="1.1">\n`;
-  svg += `  <rect x="0" y="0" width="${width}" height="${height}" fill="${options.backgroundColor}"/>\n`;
-  
-  for (const c of circles) {
-    const hexColor = hslToHex(c.color);
-    svg += `  <circle cx="${c.x.toFixed(2)}" cy="${c.y.toFixed(2)}" r="${c.r.toFixed(2)}" fill="${hexColor}" stroke="none"/>\n`;
-  }
-  
-  svg += `</svg>\n`;
-  return svg;
-}
-
-// Export all circles as a single SVG
-export function exportSingleSVG(
-  circles: Circle[],
-  width: number,
-  height: number,
-  layers: Layer[],
-  options: Partial<SVGExportOptions> = {}
-): void {
-  const opts = { ...defaultOptions, ...options };
-  
-  // Filter to only visible circles on visible layers
-  const visibleCircles = circles.filter(c => {
-    const layer = layers.find(l => l.id === c.layerId);
-    return layer?.visible && circleIntersectsCanvas(c, width, height);
-  });
-  
-  const svgContent = generateSVGContent(visibleCircles, width, height, layers, opts);
-  
-  // Create blob and download
-  const blob = new Blob([svgContent], { type: 'image/svg+xml' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `circles-export-${Date.now()}.svg`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-}
-
-// Export circles as stencil layers (non-overlapping groups with margin)
-export function exportStencils(
+// Export circles as a multi-layered SVG
+// Includes: background, artwork layer (all circles), and stencil layers (non-overlapping groups)
+export function exportSVG(
   circles: Circle[],
   width: number,
   height: number,
@@ -163,70 +110,80 @@ export function exportStencils(
     return;
   }
   
-  // Clone circles to process (we'll remove them as we assign to layers)
-  let circlesToProcess = [...visibleCircles];
-  const stencilLayers: Circle[][] = [];
+  // Compute stencil layers
+  const stencilLayers = opts.includeStencilLayers 
+    ? computeStencilLayers(visibleCircles, opts.stencilMargin)
+    : [];
   
-  // Greedy algorithm: assign circles to layers where they don't overlap
-  while (circlesToProcess.length > 0) {
-    const currentLayer: Circle[] = [];
+  // Build SVG with Inkscape-compatible layer structure
+  let svg = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n`;
+  svg += `<svg\n`;
+  svg += `  width="${width}"\n`;
+  svg += `  height="${height}"\n`;
+  svg += `  viewBox="0 0 ${width} ${height}"\n`;
+  svg += `  xmlns="http://www.w3.org/2000/svg"\n`;
+  svg += `  xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape">\n`;
+  
+  // Background layer
+  svg += `  <g inkscape:groupmode="layer" inkscape:label="Background" id="layer-background">\n`;
+  svg += `    <rect x="0" y="0" width="${width}" height="${height}" fill="${opts.backgroundColor}"/>\n`;
+  svg += `  </g>\n`;
+  
+  // Full artwork layer (all circles grouped by their original layers)
+  svg += `  <g inkscape:groupmode="layer" inkscape:label="Artwork" id="layer-artwork">\n`;
+  
+  for (const layer of layers) {
+    if (layer.type !== 'circles' || !layer.visible) continue;
     
-    // Process from end to beginning (so we can splice efficiently)
-    for (let i = circlesToProcess.length - 1; i >= 0; i--) {
-      const candidate = circlesToProcess[i];
-      
-      // Check if this circle overlaps with any already placed in current layer
-      let canPlace = true;
-      for (const placed of currentLayer) {
-        if (circlesOverlapWithMargin(candidate, placed, opts.stencilMargin)) {
-          canPlace = false;
-          break;
-        }
-      }
-      
-      if (canPlace) {
-        currentLayer.push(candidate);
-        circlesToProcess.splice(i, 1);
-      }
+    const layerCircles = visibleCircles.filter(c => c.layerId === layer.id);
+    if (layerCircles.length === 0) continue;
+    
+    // Sub-group for each app layer
+    const opacityAttr = layer.opacity < 1 ? ` opacity="${layer.opacity.toFixed(3)}"` : '';
+    svg += `    <g id="artwork-${layer.id}"${opacityAttr}>\n`;
+    
+    for (const c of layerCircles) {
+      const hexColor = hslToHex(c.color);
+      svg += `      <circle cx="${c.x.toFixed(2)}" cy="${c.y.toFixed(2)}" r="${c.r.toFixed(2)}" fill="${hexColor}"/>\n`;
     }
     
-    if (currentLayer.length > 0) {
-      stencilLayers.push(currentLayer);
-    } else {
-      // Safety break - shouldn't happen but prevents infinite loop
-      break;
-    }
+    svg += `    </g>\n`;
   }
   
-  // Create a zip-like download with multiple files
-  // For simplicity, we'll download each layer separately with a small delay
-  // Or create a combined info file
+  svg += `  </g>\n`;
   
-  const timestamp = Date.now();
-  
-  // Download each layer
-  stencilLayers.forEach((layer, index) => {
-    const svgContent = generateStencilLayerSVG(layer, width, height, opts);
-    const blob = new Blob([svgContent], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `stencil-layer-${index + 1}-of-${stencilLayers.length}-${timestamp}.svg`;
-    document.body.appendChild(link);
+  // Stencil layers (each is a separate layer with non-overlapping circles)
+  if (stencilLayers.length > 0) {
+    stencilLayers.forEach((stencilCircles, index) => {
+      const layerNum = index + 1;
+      svg += `  <g inkscape:groupmode="layer" inkscape:label="Stencil ${layerNum} (${stencilCircles.length} circles)" id="layer-stencil-${layerNum}" style="display:none">\n`;
+      
+      for (const c of stencilCircles) {
+        const hexColor = hslToHex(c.color);
+        svg += `    <circle cx="${c.x.toFixed(2)}" cy="${c.y.toFixed(2)}" r="${c.r.toFixed(2)}" fill="${hexColor}"/>\n`;
+      }
+      
+      svg += `  </g>\n`;
+    });
     
-    // Stagger downloads slightly to avoid browser blocking
-    setTimeout(() => {
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    }, index * 200);
-  });
+    console.log(`SVG includes ${stencilLayers.length} stencil layers:`);
+    stencilLayers.forEach((layer, i) => {
+      console.log(`  Stencil ${i + 1}: ${layer.length} circles`);
+    });
+  }
   
-  // Show info about export
-  console.log(`Exported ${stencilLayers.length} stencil layers:`);
-  stencilLayers.forEach((layer, i) => {
-    console.log(`  Layer ${i + 1}: ${layer.length} circles`);
-  });
+  svg += `</svg>\n`;
+  
+  // Download
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `circles-${Date.now()}.svg`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }
 
 // Get info about stencil layers without exporting (for UI preview)
@@ -242,38 +199,10 @@ export function getStencilLayerInfo(
     return layer?.visible && circleIntersectsCanvas(c, width, height);
   });
   
-  let circlesToProcess = [...visibleCircles];
-  const circleCounts: number[] = [];
-  
-  while (circlesToProcess.length > 0) {
-    const currentLayer: Circle[] = [];
-    
-    for (let i = circlesToProcess.length - 1; i >= 0; i--) {
-      const candidate = circlesToProcess[i];
-      let canPlace = true;
-      
-      for (const placed of currentLayer) {
-        if (circlesOverlapWithMargin(candidate, placed, stencilMargin)) {
-          canPlace = false;
-          break;
-        }
-      }
-      
-      if (canPlace) {
-        currentLayer.push(candidate);
-        circlesToProcess.splice(i, 1);
-      }
-    }
-    
-    if (currentLayer.length > 0) {
-      circleCounts.push(currentLayer.length);
-    } else {
-      break;
-    }
-  }
+  const stencilLayers = computeStencilLayers(visibleCircles, stencilMargin);
   
   return {
-    layerCount: circleCounts.length,
-    circleCounts,
+    layerCount: stencilLayers.length,
+    circleCounts: stencilLayers.map(l => l.length),
   };
 }

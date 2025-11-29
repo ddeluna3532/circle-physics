@@ -1,10 +1,13 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { usePhysics, useLayers } from "./hooks";
 import { Circle } from "./physics";
 import { PaintLayer } from "./layers";
 import { interpolateStroke } from "./layers/WatercolorBrush";
-import { exportSingleSVG, exportStencils } from "./layers/SVGExporter";
+import { exportSVG } from "./layers/SVGExporter";
 import { saveProject, loadProject, restoreCircles, ProjectData } from "./layers/ProjectManager";
+import { UndoManager, applySnapshot } from "./layers/UndoManager";
+import { AnimationRecorder, AnimationData, CircleSnapshot, Keyframe, saveAnimation, loadAnimationFile } from "./layers/AnimationRecorder";
+import { exportVideoHighQuality, downloadVideo, isVideoExportSupported, VideoExportProgress } from "./layers/VideoExporter";
 import "./styles.css";
 
 function App() {
@@ -74,6 +77,38 @@ function App() {
   const [stickyMode, setStickyMode] = useState(false);
   const [stickyStrength, setStickyStrength] = useState(0.15);
   
+  // Collision settings
+  const [collisionIterations, setCollisionIterations] = useState(3);
+  const [restitution, setRestitution] = useState(0.6);
+  const [physicsPaused, setPhysicsPaused] = useState(false);
+  
+  // Undo/Redo system
+  const undoManager = useMemo(() => new UndoManager(50), []);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  
+  // Animation recording/playback state
+  const animationRecorder = useMemo(() => new AnimationRecorder(30), []);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPlayingAnimation, setIsPlayingAnimation] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [recordingFrames, setRecordingFrames] = useState(0);
+  const [animationDuration, setAnimationDuration] = useState(0);
+  const [playbackCircles, setPlaybackCircles] = useState<CircleSnapshot[] | null>(null);
+  const [hasAnimation, setHasAnimation] = useState(false);
+  const [smoothingStrength, setSmoothingStrength] = useState(0.4);
+  
+  // Video export state
+  const [isExportingVideo, setIsExportingVideo] = useState(false);
+  const [exportProgress, setExportProgress] = useState<VideoExportProgress | null>(null);
+  const [exportResolution, setExportResolution] = useState(1); // 1x, 2x, 4x multiplier
+  
+  // Export camera state (orthographic)
+  const [exportCameraZoom, setExportCameraZoom] = useState(1); // 1 = 100%, 2 = 200% zoom in
+  const [exportCameraPanX, setExportCameraPanX] = useState(0); // Pan offset as percentage of canvas
+  const [exportCameraPanY, setExportCameraPanY] = useState(0);
+  const [showCameraPreview, setShowCameraPreview] = useState(false);
+  
   // Scale all slider state
   const scaleSliderRef = useRef(0); // -1 to 1, 0 is center
   const [scaleSliderValue, setScaleSliderValue] = useState(0);
@@ -92,15 +127,129 @@ function App() {
   const isPaintingLayerRef = useRef(false);
   const lastPaintPosRef = useRef({ x: 0, y: 0 });
   
+  // Default color palettes
+  const DEFAULT_CIRCLE_PALETTE = [
+    { h: 187, s: 94, l: 18 },  // #034f59 - dark teal
+    { h: 156, s: 38, l: 67 },  // #8ccbb2 - sage green
+    { h: 41, s: 52, l: 91 },   // #f2ebdc - cream
+    { h: 11, s: 100, l: 71 },  // #ff8469 - coral
+    { h: 190, s: 8, l: 29 },   // #444e50 - dark gray
+  ];
+  
+  const DEFAULT_BG_PALETTE = [
+    { h: 0, s: 0, l: 100 },    // #ffffff - white
+    { h: 0, s: 0, l: 0 },      // #000000 - black
+    { h: 41, s: 45, l: 85 },   // #ebe0c8 - warm cream
+    { h: 0, s: 0, l: 25 },     // #404040 - dark gray
+    { h: 0, s: 0, l: 75 },     // #bfbfbf - light gray
+  ];
+
   // Color palette state
-  const [palette, setPalette] = useState([
-    { h: 200, s: 70, l: 60 },
-    { h: 350, s: 70, l: 60 },
-    { h: 120, s: 70, l: 50 },
-    { h: 45, s: 80, l: 55 },
-    { h: 280, s: 60, l: 60 },
-  ]);
+  const [palette, setPalette] = useState(DEFAULT_CIRCLE_PALETTE);
   const [selectedSwatch, setSelectedSwatch] = useState(0);
+  
+  // Background palette state
+  const [bgPalette, setBgPalette] = useState(DEFAULT_BG_PALETTE);
+  const [selectedBgSwatch, setSelectedBgSwatch] = useState(2); // Default to warm cream
+  
+  // Get current background color as HSL string
+  const getBackgroundColor = useCallback(() => {
+    const bg = bgPalette[selectedBgSwatch];
+    return `hsl(${bg.h}, ${bg.s}%, ${bg.l}%)`;
+  }, [bgPalette, selectedBgSwatch]);
+  
+  // Get current background color as hex for SVG export
+  const getBackgroundHex = useCallback(() => {
+    const bg = bgPalette[selectedBgSwatch];
+    const h = bg.h;
+    const s = bg.s / 100;
+    const l = bg.l / 100;
+    
+    const a = s * Math.min(l, 1 - l);
+    const f = (n: number) => {
+      const k = (n + h / 30) % 12;
+      return l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+    };
+    
+    const r = Math.round(f(0) * 255);
+    const g = Math.round(f(8) * 255);
+    const b = Math.round(f(4) * 255);
+    
+    return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+  }, [bgPalette, selectedBgSwatch]);
+  
+  // Update background palette
+  const updateBgPalette = useCallback((key: 'h' | 's' | 'l', value: number) => {
+    setBgPalette(prev => {
+      const newPalette = [...prev];
+      newPalette[selectedBgSwatch] = { ...newPalette[selectedBgSwatch], [key]: value };
+      return newPalette;
+    });
+  }, [selectedBgSwatch]);
+
+  // Reset palettes to defaults
+  const resetCirclePalette = useCallback(() => {
+    setPalette(DEFAULT_CIRCLE_PALETTE);
+    setSelectedSwatch(0);
+  }, []);
+
+  const resetBgPalette = useCallback(() => {
+    setBgPalette(DEFAULT_BG_PALETTE);
+    setSelectedBgSwatch(2);
+  }, []);
+
+  // Save palettes to file
+  const savePalettes = useCallback(() => {
+    const data = {
+      version: 1,
+      circlePalette: palette,
+      bgPalette: bgPalette,
+    };
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const name = prompt('Palette name:', 'my-palette') || 'my-palette';
+    link.href = url;
+    link.download = `${name}.palette.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, [palette, bgPalette]);
+
+  // Load palettes from file
+  const loadPalettes = useCallback(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = JSON.parse(event.target?.result as string);
+          if (data.circlePalette && Array.isArray(data.circlePalette)) {
+            setPalette(data.circlePalette);
+            setSelectedSwatch(0);
+          }
+          if (data.bgPalette && Array.isArray(data.bgPalette)) {
+            setBgPalette(data.bgPalette);
+            setSelectedBgSwatch(0);
+          }
+          console.log('Palettes loaded');
+        } catch (err) {
+          console.error('Failed to parse palette file:', err);
+        }
+      };
+      reader.readAsText(file);
+    };
+    
+    input.click();
+  }, []);
   
   // Drag state
   const [dragging, setDragging] = useState<Circle | null>(null);
@@ -136,6 +285,8 @@ function App() {
   const selectionRectRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   const isDraggingSelectionRef = useRef(false);
   const selectionDragStartRef = useRef({ x: 0, y: 0 });
+  const isPaintSelectingRef = useRef(false); // Paint selection mode
+  const paintSelectedThisStroke = useRef<Set<number>>(new Set()); // Track circles selected this stroke
 
   // Generate color from selected swatch with slight variation
   const getColor = useCallback(() => {
@@ -169,7 +320,7 @@ function App() {
     if (!ctx) return;
 
     // Clear
-    ctx.fillStyle = "#ebe0cc";
+    ctx.fillStyle = getBackgroundColor();
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     // Draw floor line if enabled
@@ -195,15 +346,18 @@ function App() {
           ctx.drawImage(paintLayer.canvas, 0, 0);
         }
       } else if (layer.type === 'circles') {
-        // Render circles on this layer
-        for (const c of circles) {
-          if (c.layerId !== layer.id) continue;
-          
+        // Use playback circles if playing animation, otherwise use real circles
+        const circlesToRender = playbackCircles 
+          ? playbackCircles.filter(c => c.layerId === layer.id)
+          : circles.filter(c => c.layerId === layer.id);
+        
+        for (const c of circlesToRender) {
           ctx.beginPath();
           ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
           
-          // Darken and desaturate locked circles
-          if (c.locked || layer.locked) {
+          // Darken and desaturate locked circles (only for real circles)
+          const isLocked = !playbackCircles && ((c as Circle).locked || layer.locked);
+          if (isLocked) {
             const match = c.color.match(/hsl\(([\d.]+),\s*([\d.]+)%,\s*([\d.]+)%\)/);
             if (match) {
               const h = parseFloat(match[1]);
@@ -306,21 +460,74 @@ function App() {
       ctx.strokeRect(r.x, r.y, r.w, r.h);
       ctx.setLineDash([]);
     }
-  }, [circles, config, magnetMode, magnetRadius, flowVisible, system.flowVectors, layers, getActiveLayer, brush, selectedIds]);
+    
+    // Draw camera preview frame when enabled
+    if (showCameraPreview && exportCameraZoom !== 1) {
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const panX = exportCameraPanX * canvas.width / 100;
+      const panY = exportCameraPanY * canvas.height / 100;
+      
+      // Calculate the visible area at current zoom
+      const visibleWidth = canvas.width / exportCameraZoom;
+      const visibleHeight = canvas.height / exportCameraZoom;
+      
+      // Calculate the top-left corner of visible area
+      const viewLeft = centerX + panX - visibleWidth / 2;
+      const viewTop = centerY + panY - visibleHeight / 2;
+      
+      // Darken area outside camera view
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+      // Top
+      ctx.fillRect(0, 0, canvas.width, viewTop);
+      // Bottom
+      ctx.fillRect(0, viewTop + visibleHeight, canvas.width, canvas.height - viewTop - visibleHeight);
+      // Left
+      ctx.fillRect(0, viewTop, viewLeft, visibleHeight);
+      // Right
+      ctx.fillRect(viewLeft + visibleWidth, viewTop, canvas.width - viewLeft - visibleWidth, visibleHeight);
+      
+      // Draw camera frame border
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.9)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([10, 5]);
+      ctx.strokeRect(viewLeft, viewTop, visibleWidth, visibleHeight);
+      ctx.setLineDash([]);
+      
+      // Draw crosshair at center
+      const crossSize = 20;
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(centerX + panX - crossSize, centerY + panY);
+      ctx.lineTo(centerX + panX + crossSize, centerY + panY);
+      ctx.moveTo(centerX + panX, centerY + panY - crossSize);
+      ctx.lineTo(centerX + panX, centerY + panY + crossSize);
+      ctx.stroke();
+    }
+  }, [circles, config, magnetMode, magnetRadius, flowVisible, system.flowVectors, layers, getActiveLayer, brush, selectedIds, getBackgroundColor, playbackCircles, showCameraPreview, exportCameraZoom, exportCameraPanX, exportCameraPanY]);
 
   // Apply magnet force to circles
   // Check if a circle should be affected by forces (not locked, layer not locked)
+  // When in select mode with selection, only selected circles are affected
   const isCircleAffected = useCallback((c: Circle): boolean => {
     if (c.locked || c.isDragging) return false;
-    return isLayerAffectedByForces(c.layerId);
-  }, [isLayerAffectedByForces]);
+    if (!isLayerAffectedByForces(c.layerId)) return false;
+    // If in select mode with selection, only affect selected circles
+    if (selectMode && selectedIds.size > 0 && !selectedIds.has(c.id)) return false;
+    return true;
+  }, [isLayerAffectedByForces, selectMode, selectedIds]);
 
   // Check if a circle can be modified at all (dragged, recolored, etc)
+  // When in select mode with selection, only selected circles are modifiable
   const isCircleModifiable = useCallback((c: Circle): boolean => {
     if (c.locked) return false;
     const layer = layers.find(l => l.id === c.layerId);
-    return layer ? !layer.locked : true;
-  }, [layers]);
+    if (layer?.locked) return false;
+    // If in select mode with selection, only modify selected circles
+    if (selectMode && selectedIds.size > 0 && !selectedIds.has(c.id)) return false;
+    return true;
+  }, [layers, selectMode, selectedIds]);
 
   // Check if a point is inside a circle
   const isPointInCircle = useCallback((px: number, py: number, c: Circle): boolean => {
@@ -393,6 +600,100 @@ function App() {
     setSelectedIds(new Set());
   }, []);
 
+  // Invert selection - select unselected, deselect selected
+  const invertSelection = useCallback(() => {
+    const visibleCircleIds = circles
+      .filter(c => {
+        const layer = layers.find(l => l.id === c.layerId);
+        return layer?.visible;
+      })
+      .map(c => c.id);
+    
+    const newSelection = new Set<number>();
+    for (const id of visibleCircleIds) {
+      if (!selectedIds.has(id)) {
+        newSelection.add(id);
+      }
+    }
+    setSelectedIds(newSelection);
+  }, [circles, layers, selectedIds]);
+
+  // Lock inverse - lock all circles that are NOT selected
+  const lockInverse = useCallback(() => {
+    let lockedCount = 0;
+    for (const c of circles) {
+      // Skip if selected
+      if (selectedIds.has(c.id)) continue;
+      // Skip if already locked
+      if (c.locked) continue;
+      // Check if on visible layer
+      const layer = layers.find(l => l.id === c.layerId);
+      if (!layer?.visible) continue;
+      
+      c.locked = true;
+      lockedCount++;
+    }
+    console.log(`Locked ${lockedCount} circles (inverse of selection)`);
+  }, [circles, layers, selectedIds]);
+
+  // Unlock all circles
+  const unlockAll = useCallback(() => {
+    let unlockedCount = 0;
+    for (const c of circles) {
+      if (c.locked) {
+        c.locked = false;
+        unlockedCount++;
+      }
+    }
+    console.log(`Unlocked ${unlockedCount} circles`);
+  }, [circles]);
+
+  // Update undo/redo availability
+  const updateUndoRedoState = useCallback(() => {
+    setCanUndo(undoManager.canUndo());
+    setCanRedo(undoManager.canRedo());
+  }, [undoManager]);
+
+  // Save current state to undo history
+  const saveUndoState = useCallback((force: boolean = false) => {
+    undoManager.saveState(circles, force);
+    updateUndoRedoState();
+  }, [undoManager, circles, updateUndoRedoState]);
+
+  // Perform undo
+  const performUndo = useCallback(() => {
+    const snapshot = undoManager.undo();
+    if (snapshot) {
+      applySnapshot(circles, snapshot, (newCircles) => {
+        // Clear existing circles and add new ones
+        circles.length = 0;
+        circles.push(...newCircles);
+      });
+      updateUndoRedoState();
+      clearSelection();
+    }
+  }, [undoManager, circles, updateUndoRedoState, clearSelection]);
+
+  // Perform redo
+  const performRedo = useCallback(() => {
+    const snapshot = undoManager.redo();
+    if (snapshot) {
+      applySnapshot(circles, snapshot, (newCircles) => {
+        // Clear existing circles and add new ones
+        circles.length = 0;
+        circles.push(...newCircles);
+      });
+      updateUndoRedoState();
+      clearSelection();
+    }
+  }, [undoManager, circles, updateUndoRedoState, clearSelection]);
+
+  // Initialize undo history when app starts
+  useEffect(() => {
+    undoManager.initialize(circles);
+    updateUndoRedoState();
+  }, []); // Only run once on mount
+
   const applyMagnet = useCallback(() => {
     if (!isMagnetActiveRef.current || magnetMode === 'off') return;
     
@@ -433,8 +734,13 @@ function App() {
     if (nBodyMode === 'off') return;
     
     const direction = nBodyMode === 'clump' ? 1 : -1;
+    const startTime = performance.now();
+    const maxTime = 8; // Max 8ms for n-body calculations
     
     for (let i = 0; i < circles.length; i++) {
+      // Check time budget periodically
+      if (i % 50 === 0 && performance.now() - startTime > maxTime) break;
+      
       const a = circles[i];
       const aAffected = isCircleAffected(a);
       for (let j = i + 1; j < circles.length; j++) {
@@ -480,7 +786,13 @@ function App() {
   const applyStickyForce = useCallback(() => {
     if (!stickyMode) return;
     
+    const startTime = performance.now();
+    const maxTime = 8; // Max 8ms for sticky calculations
+    
     for (let i = 0; i < circles.length; i++) {
+      // Check time budget periodically
+      if (i % 50 === 0 && performance.now() - startTime > maxTime) break;
+      
       const a = circles[i];
       const aAffected = isCircleAffected(a);
       for (let j = i + 1; j < circles.length; j++) {
@@ -527,7 +839,7 @@ function App() {
     }
   }, [circles, stickyMode, stickyStrength, isCircleAffected]);
 
-  // Apply continuous scaling to all circles
+  // Apply continuous scaling to all circles (or just selected if in select mode)
   const applyScaling = useCallback(() => {
     if (!isScalingRef.current || scaleSliderRef.current === 0) return;
     
@@ -535,14 +847,16 @@ function App() {
     
     for (const c of circles) {
       if (c.locked || !isLayerAffectedByForces(c.layerId)) continue;
+      // If in select mode with selection, only scale selected circles
+      if (selectMode && selectedIds.size > 0 && !selectedIds.has(c.id)) continue;
       const newRadius = c.r * scaleFactor;
       // Clamp between 5 and 200
       c.r = Math.max(5, Math.min(200, newRadius));
       c.mass = c.r * c.r;
     }
-  }, [circles, isLayerAffectedByForces]);
+  }, [circles, isLayerAffectedByForces, selectMode, selectedIds]);
 
-  // Apply random scaling to all circles
+  // Apply random scaling to all circles (or just selected if in select mode)
   const applyRandomScaling = useCallback(() => {
     if (!isRandomScalingRef.current || randomScaleSliderRef.current === 0) return;
     
@@ -550,17 +864,32 @@ function App() {
     
     for (const c of circles) {
       if (c.locked || !isLayerAffectedByForces(c.layerId)) continue;
-      // Random scale factor for each circle - can grow OR shrink regardless of direction
-      // Direction just biases toward growing or shrinking
-      const bias = randomScaleSliderRef.current > 0 ? 0.6 : -0.6;
-      const randomValue = (Math.random() - 0.5 + bias) * intensity * 0.08;
-      const scaleFactor = 1 + randomValue;
+      // If in select mode with selection, only scale selected circles
+      if (selectMode && selectedIds.size > 0 && !selectedIds.has(c.id)) continue;
+      
+      // More varied random scaling with occasional big changes
+      const direction = randomScaleSliderRef.current > 0 ? 1 : -1;
+      
+      // Base random value with higher variance
+      let randomValue = (Math.random() - 0.5) * 2; // -1 to 1
+      
+      // Add directional bias
+      randomValue += direction * 0.3;
+      
+      // Occasional big jumps (10% chance)
+      if (Math.random() < 0.1) {
+        randomValue *= 2.5;
+      }
+      
+      // Scale by intensity (0.15 base multiplier, was 0.08)
+      const scaleFactor = 1 + randomValue * intensity * 0.15;
       const newRadius = c.r * scaleFactor;
+      
       // Clamp between 5 and 200
       c.r = Math.max(5, Math.min(200, newRadius));
       c.mass = c.r * c.r;
     }
-  }, [circles, isLayerAffectedByForces]);
+  }, [circles, isLayerAffectedByForces, selectMode, selectedIds]);
 
   // Auto-spawn circles in random open areas
   const autoSpawn = useCallback(() => {
@@ -610,31 +939,340 @@ function App() {
     brush.setSettings({ size: brushSize });
   }, [brush, brushSize]);
 
-  // Set up physics system to respect layer locks
+  // Set up physics system to respect layer locks and selection
   useEffect(() => {
     system.setAffectedCheck((c: Circle) => {
       if (c.locked || c.isDragging) return false;
-      return isLayerAffectedByForces(c.layerId);
+      if (!isLayerAffectedByForces(c.layerId)) return false;
+      // If in select mode with selection, only affect selected circles
+      if (selectMode && selectedIds.size > 0 && !selectedIds.has(c.id)) return false;
+      return true;
     });
-  }, [system, isLayerAffectedByForces]);
+  }, [system, isLayerAffectedByForces, selectMode, selectedIds]);
+
+  // Sync collision settings with physics system
+  useEffect(() => {
+    system.collisionIterations = collisionIterations;
+    system.restitution = restitution;
+  }, [system, collisionIterations, restitution]);
+
+  // Animation recording controls
+  const startRecording = useCallback(() => {
+    animationRecorder.setRecordingCallback((duration, frames) => {
+      setRecordingDuration(duration);
+      setRecordingFrames(frames);
+    });
+    animationRecorder.startRecording(system.circles);
+    setIsRecording(true);
+    setPhysicsPaused(false); // Ensure physics is running
+  }, [animationRecorder, system.circles]);
+
+  const stopRecording = useCallback(() => {
+    const data = animationRecorder.stopRecording();
+    setIsRecording(false);
+    if (data) {
+      setAnimationDuration(data.duration);
+      setHasAnimation(true);
+    }
+  }, [animationRecorder]);
+
+  const playAnimation = useCallback(() => {
+    if (!animationRecorder.hasAnimation()) return;
+    
+    setPhysicsPaused(true); // Pause physics during playback
+    setIsPlayingAnimation(true);
+    
+    animationRecorder.startPlayback(
+      (circles) => {
+        setPlaybackCircles(circles);
+      },
+      () => {
+        setIsPlayingAnimation(false);
+        setPlaybackCircles(null);
+      },
+      true // loop
+    );
+  }, [animationRecorder]);
+
+  const stopAnimation = useCallback(() => {
+    animationRecorder.stopPlayback();
+    setIsPlayingAnimation(false);
+    setPlaybackCircles(null);
+  }, [animationRecorder]);
+
+  const saveCurrentAnimation = useCallback(() => {
+    if (!animationRecorder.hasAnimation()) {
+      console.log('No animation to save');
+      return;
+    }
+    
+    // Build animation data from recorder
+    const animData: AnimationData = {
+      version: 1,
+      name: `animation-${Date.now()}`,
+      duration: animationRecorder.getDuration(),
+      keyframes: animationRecorder.getKeyframes(),
+      fps: animationRecorder.getFPS(),
+    };
+    
+    const name = prompt('Animation name:', animData.name) || animData.name;
+    saveAnimation({ ...animData, name }, name);
+  }, [animationRecorder]);
+
+  const loadAnimation = useCallback(async () => {
+    const data = await loadAnimationFile();
+    if (data) {
+      animationRecorder.loadAnimation(data);
+      setAnimationDuration(data.duration);
+      setHasAnimation(true);
+      console.log(`Loaded animation: ${data.name}`);
+    }
+  }, [animationRecorder]);
+
+  const clearAnimation = useCallback(() => {
+    animationRecorder.clear();
+    setHasAnimation(false);
+    setAnimationDuration(0);
+    setRecordingDuration(0);
+    setRecordingFrames(0);
+    setPlaybackCircles(null);
+  }, [animationRecorder]);
+
+  const applyAnimationSmoothing = useCallback(() => {
+    if (!animationRecorder.hasAnimation()) return;
+    
+    // Stop playback if playing
+    if (animationRecorder.getIsPlaying()) {
+      animationRecorder.stopPlayback();
+      setIsPlayingAnimation(false);
+      setPlaybackCircles(null);
+    }
+    
+    // Apply smoothing
+    animationRecorder.applySmoothing(smoothingStrength);
+    
+    console.log(`Applied smoothing with strength ${smoothingStrength}`);
+  }, [animationRecorder, smoothingStrength]);
+
+  // Export animation as video
+  const exportAnimationVideo = useCallback(async () => {
+    if (!animationRecorder.hasAnimation()) return;
+    if (!canvasRef.current) return;
+    if (!isVideoExportSupported()) {
+      alert('Video export is not supported in this browser');
+      return;
+    }
+    
+    const sourceCanvas = canvasRef.current;
+    
+    // Stop any playback
+    if (animationRecorder.getIsPlaying()) {
+      animationRecorder.stopPlayback();
+      setIsPlayingAnimation(false);
+      setPlaybackCircles(null);
+    }
+    
+    setIsExportingVideo(true);
+    setExportProgress({ phase: 'preparing', progress: 0, message: 'Preparing...' });
+    
+    // Get a snapshot of keyframes at export time to ensure we use smoothed data
+    const keyframesSnapshot = animationRecorder.getKeyframes();
+    console.log(`Exporting ${keyframesSnapshot.length} keyframes`);
+    
+    // Create offscreen canvas at target resolution
+    const scale = exportResolution;
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = sourceCanvas.width * scale;
+    exportCanvas.height = sourceCanvas.height * scale;
+    const ctx = exportCanvas.getContext('2d');
+    if (!ctx) {
+      setIsExportingVideo(false);
+      return;
+    }
+    
+    const duration = animationRecorder.getDuration();
+    
+    // Camera parameters
+    const zoom = exportCameraZoom;
+    const panX = exportCameraPanX * sourceCanvas.width / 100;
+    const panY = exportCameraPanY * sourceCanvas.height / 100;
+    const centerX = sourceCanvas.width / 2;
+    const centerY = sourceCanvas.height / 2;
+    
+    // Helper function to interpolate frame from snapshot
+    const getFrameFromSnapshot = (time: number): CircleSnapshot[] | null => {
+      if (keyframesSnapshot.length === 0) return null;
+      
+      let prevIdx = 0;
+      let nextIdx = 0;
+      
+      for (let i = 0; i < keyframesSnapshot.length; i++) {
+        if (keyframesSnapshot[i].time <= time) {
+          prevIdx = i;
+        }
+        if (keyframesSnapshot[i].time >= time) {
+          nextIdx = i;
+          break;
+        }
+      }
+      
+      if (prevIdx === nextIdx || nextIdx === 0) {
+        return keyframesSnapshot[prevIdx].circles;
+      }
+      
+      const prevFrame = keyframesSnapshot[prevIdx];
+      const nextFrame = keyframesSnapshot[nextIdx];
+      const t = (time - prevFrame.time) / (nextFrame.time - prevFrame.time);
+      
+      const nextMap = new Map<number, CircleSnapshot>();
+      for (const c of nextFrame.circles) {
+        nextMap.set(c.id, c);
+      }
+      
+      const interpolated: CircleSnapshot[] = [];
+      
+      for (const prev of prevFrame.circles) {
+        const next = nextMap.get(prev.id);
+        if (next) {
+          interpolated.push({
+            id: prev.id,
+            x: prev.x + (next.x - prev.x) * t,
+            y: prev.y + (next.y - prev.y) * t,
+            r: prev.r + (next.r - prev.r) * t,
+            color: prev.color,
+            layerId: prev.layerId,
+          });
+        } else {
+          interpolated.push({ ...prev });
+        }
+      }
+      
+      for (const next of nextFrame.circles) {
+        if (!interpolated.find(c => c.id === next.id)) {
+          interpolated.push({ ...next });
+        }
+      }
+      
+      return interpolated;
+    };
+    
+    // Render function for export - draws a frame at specific time
+    const renderFrameForExport = (time: number) => {
+      const frame = getFrameFromSnapshot(time);
+      if (!frame) return;
+      
+      // Clear canvas with background
+      const bg = bgPalette[selectedBgSwatch];
+      ctx.fillStyle = `hsl(${bg.h}, ${bg.s}%, ${bg.l}%)`;
+      ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+      
+      // Apply transforms: resolution scale, then camera
+      ctx.save();
+      ctx.scale(scale, scale);
+      
+      // Apply orthographic camera transform
+      ctx.translate(centerX, centerY);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-centerX - panX, -centerY - panY);
+      
+      // Render layers in order
+      for (const layer of layers) {
+        if (!layer.visible) continue;
+        
+        ctx.globalAlpha = layer.opacity;
+        
+        if (layer.type === 'paint') {
+          // Render paint layer (scaled)
+          const paintLayer = layer as PaintLayer;
+          if (paintLayer.canvas) {
+            ctx.drawImage(paintLayer.canvas, 0, 0);
+          }
+        } else if (layer.type === 'circles') {
+          // Render circles from animation frame
+          const layerCircles = frame.filter(c => c.layerId === layer.id);
+          
+          for (const c of layerCircles) {
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+            ctx.fillStyle = c.color;
+            ctx.fill();
+          }
+        }
+        
+        ctx.globalAlpha = 1;
+      }
+      
+      ctx.restore();
+    };
+    
+    const exportFps = 30;
+    
+    try {
+      const blob = await exportVideoHighQuality(
+        exportCanvas,
+        renderFrameForExport,
+        duration,
+        { fps: exportFps, quality: 0.9 },
+        setExportProgress
+      );
+      
+      if (blob) {
+        const resLabel = scale > 1 ? `_${exportCanvas.width}x${exportCanvas.height}` : '';
+        const zoomLabel = zoom !== 1 ? `_${zoom}x` : '';
+        const defaultName = `animation${resLabel}${zoomLabel}_${exportFps}fps`;
+        const name = prompt('PNG Sequence filename:', defaultName) || defaultName;
+        downloadVideo(blob, `${name}.zip`);
+      }
+    } catch (err) {
+      console.error('Video export failed:', err);
+      setExportProgress({ phase: 'error', progress: 0, message: 'Export failed' });
+    }
+    
+    setIsExportingVideo(false);
+    
+    // Re-render current state
+    render();
+  }, [animationRecorder, bgPalette, selectedBgSwatch, layers, render, exportResolution, exportCameraZoom, exportCameraPanX, exportCameraPanY]);
 
   // Animation loop
   useEffect(() => {
     let lastTime = performance.now();
+    let slowFrameCount = 0;
 
     const loop = (time: number) => {
-      const _delta = time - lastTime;
+      const delta = time - lastTime;
       lastTime = time;
+      
+      // Performance monitoring - if frames are taking too long, auto-pause
+      if (delta > 100) { // More than 100ms per frame = very slow
+        slowFrameCount++;
+        if (slowFrameCount > 5) {
+          console.warn('Performance critical - auto-pausing physics');
+          setPhysicsPaused(true);
+          slowFrameCount = 0;
+        }
+      } else {
+        slowFrameCount = Math.max(0, slowFrameCount - 1);
+      }
 
-      applyMagnet();
-      applyNBodyForce();
-      applyStickyForce();
-      applyScaling();
-      applyRandomScaling();
-      autoSpawn();
-      autoSpawnRandom();
-      system.applyFlowField();
-      system.update();
+      // Only run physics if not paused and not playing animation
+      if (!physicsPaused && !isPlayingAnimation) {
+        applyMagnet();
+        applyNBodyForce();
+        applyStickyForce();
+        applyScaling();
+        applyRandomScaling();
+        autoSpawn();
+        autoSpawnRandom();
+        system.applyFlowField();
+        system.update();
+      }
+      
+      // Capture frame if recording
+      if (isRecording) {
+        animationRecorder.captureFrame(system.circles);
+      }
+      
       render();
 
       animationRef.current = requestAnimationFrame(loop);
@@ -642,7 +1280,7 @@ function App() {
 
     animationRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animationRef.current);
-  }, [system, render, applyMagnet, applyNBodyForce, applyStickyForce, applyScaling, applyRandomScaling, autoSpawn, autoSpawnRandom]);
+  }, [system, render, applyMagnet, applyNBodyForce, applyStickyForce, applyScaling, applyRandomScaling, autoSpawn, autoSpawnRandom, physicsPaused, isRecording, isPlayingAnimation, animationRecorder]);
 
   // Handle canvas resize
   useEffect(() => {
@@ -690,27 +1328,67 @@ function App() {
     return () => window.removeEventListener("resize", resize);
   }, [setBounds, system, aspectRatio, resizeAllPaintLayers]);
 
-  // Keyboard shortcuts for selection
+  // Keyboard shortcuts for selection, physics, undo/redo, and animation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't trigger shortcuts if typing in an input
+      const isInput = e.target instanceof HTMLInputElement;
+      
+      // Undo - Ctrl+Z (works even in inputs for consistency)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        performUndo();
+        return;
+      }
+      
+      // Redo - Ctrl+Y or Ctrl+Shift+Z
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        performRedo();
+        return;
+      }
+      
+      if (isInput) return;
+      
       // Delete key - delete selected circles
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0) {
         e.preventDefault();
         deleteSelection();
+        saveUndoState(true);
       }
-      // Escape - clear selection or exit select mode
+      // Escape - clear selection, exit select mode, or stop animation
       if (e.key === 'Escape') {
-        if (selectedIds.size > 0) {
+        if (isPlayingAnimation) {
+          stopAnimation();
+        } else if (isRecording) {
+          stopRecording();
+        } else if (selectedIds.size > 0) {
           clearSelection();
         } else if (selectMode) {
           setSelectMode(false);
+        }
+      }
+      // P or Space - toggle physics pause (not during animation)
+      if (e.key === 'p' || e.key === 'P' || e.key === ' ') {
+        if (isPlayingAnimation) return;
+        e.preventDefault();
+        setPhysicsPaused(prev => !prev);
+      }
+      // R - toggle recording
+      if (e.key === 'r' || e.key === 'R') {
+        if (isPlayingAnimation) return;
+        e.preventDefault();
+        if (isRecording) {
+          stopRecording();
+        } else {
+          startRecording();
         }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedIds, deleteSelection, clearSelection, selectMode]);
+  }, [selectedIds, deleteSelection, clearSelection, selectMode, performUndo, performRedo, saveUndoState, isRecording, isPlayingAnimation, startRecording, stopRecording, stopAnimation]);
 
   // Get canvas-relative coordinates from mouse or touch event
   const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
@@ -852,23 +1530,25 @@ function App() {
         return;
       }
       
-      // Check if clicking on an unselected circle (select just that one)
+      // Check if clicking on an unselected circle (start paint selection)
       if (hit) {
+        // Start paint selection mode
+        isPaintSelectingRef.current = true;
+        paintSelectedThisStroke.current = new Set();
+        
         // Shift+click to add to selection, otherwise replace selection
         if ((e as React.MouseEvent).shiftKey) {
           setSelectedIds(prev => {
             const next = new Set(prev);
-            if (next.has(hit.id)) {
-              next.delete(hit.id);
-            } else {
-              next.add(hit.id);
-            }
+            next.add(hit.id);
+            paintSelectedThisStroke.current.add(hit.id);
             return next;
           });
         } else {
           setSelectedIds(new Set([hit.id]));
+          paintSelectedThisStroke.current.add(hit.id);
         }
-        console.log("selected circle", hit.id);
+        console.log("started paint selection with circle", hit.id);
         return;
       }
       
@@ -1010,6 +1690,20 @@ function App() {
       return;
     }
     
+    // Paint selection mode - add circles under cursor to selection
+    if (isPaintSelectingRef.current) {
+      const hit = getCircleAt(x, y);
+      if (hit && !paintSelectedThisStroke.current.has(hit.id)) {
+        setSelectedIds(prev => {
+          const next = new Set(prev);
+          next.add(hit.id);
+          return next;
+        });
+        paintSelectedThisStroke.current.add(hit.id);
+      }
+      return;
+    }
+    
     if (isDraggingSelectionRef.current) {
       // Move all selected circles
       const dx = x - selectionDragStartRef.current.x;
@@ -1068,19 +1762,29 @@ function App() {
   };
 
   const handlePointerUp = (e?: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+    // Track if we made changes that need undo save
+    let madeChanges = false;
+    
     // Clear pinch state
     if (pinchRef.current.circle) {
       console.log("pinch ended, final radius:", pinchRef.current.circle.r);
       pinchRef.current = { circle: null, initialDistance: 0, initialRadius: 0 };
+      madeChanges = true;
     }
     
     // Clear erase state
+    if (isErasingRef.current) {
+      madeChanges = true;
+    }
     isErasingRef.current = false;
     
     // Clear lock state
     isLockingRef.current = false;
     
     // Clear recolor state
+    if (isRecoloringRef.current) {
+      madeChanges = true;
+    }
     isRecoloringRef.current = false;
     
     // Clear magnet state
@@ -1118,7 +1822,17 @@ function App() {
     }
     
     // Clear selection drag state
+    if (isDraggingSelectionRef.current) {
+      madeChanges = true;
+    }
     isDraggingSelectionRef.current = false;
+    
+    // Clear paint selection state
+    if (isPaintSelectingRef.current) {
+      console.log("paint selected", paintSelectedThisStroke.current.size, "circles");
+    }
+    isPaintSelectingRef.current = false;
+    paintSelectedThisStroke.current.clear();
     
     console.log("pointerUp, wasDragging:", !!draggingRef.current, "wasPainting:", isPaintingRef.current);
     
@@ -1128,8 +1842,18 @@ function App() {
       draggingRef.current.isDragging = false;
       draggingRef.current = null;
       setDragging(null);
+      madeChanges = true;
+    }
+    
+    if (isPaintingRef.current) {
+      madeChanges = true;
     }
     isPaintingRef.current = false;
+    
+    // Save undo state if we made changes
+    if (madeChanges) {
+      saveUndoState(true);
+    }
   };
 
   return (
@@ -1169,28 +1893,226 @@ function App() {
             onClick={() => {
               const canvas = canvasRef.current;
               if (!canvas) return;
-              exportSingleSVG(system.circles, canvas.width, canvas.height, layers, {
-                backgroundColor: '#ebe0cc',
+              exportSVG(system.circles, canvas.width, canvas.height, layers, {
+                backgroundColor: getBackgroundHex(),
+                stencilMargin: 10,
+                includeStencilLayers: true,
               });
             }}
-            title="Export all visible circles as a single SVG file"
+            title="Export as multi-layered SVG (includes stencil layers for cutting)"
           >
             SVG
           </button>
-          <button 
-            onClick={() => {
-              const canvas = canvasRef.current;
-              if (!canvas) return;
-              exportStencils(system.circles, canvas.width, canvas.height, layers, {
-                backgroundColor: '#ebe0cc',
-                stencilMargin: 10,
-              });
-            }}
-            title="Export as stencil layers (non-overlapping circles separated for cutting)"
-          >
-            Stencils
-          </button>
         </div>
+
+        <h2>Animation</h2>
+
+        <div className="control-group">
+          {!isRecording && !isPlayingAnimation && (
+            <button
+              onClick={startRecording}
+              className="danger"
+              title="Start recording animation (R)"
+            >
+              ⏺ Record
+            </button>
+          )}
+          {isRecording && (
+            <button
+              onClick={stopRecording}
+              className="active danger"
+              title="Stop recording (R or Escape)"
+            >
+              ⏹ Stop ({(recordingDuration / 1000).toFixed(1)}s, {recordingFrames} frames)
+            </button>
+          )}
+        </div>
+
+        {hasAnimation && !isRecording && (
+          <div className="control-group">
+            {!isPlayingAnimation ? (
+              <button
+                onClick={playAnimation}
+                className="active"
+                title="Play recorded animation"
+              >
+                ▶ Play ({(animationDuration / 1000).toFixed(1)}s)
+              </button>
+            ) : (
+              <button
+                onClick={stopAnimation}
+                className="active warning"
+                title="Stop playback (Escape)"
+              >
+                ⏹ Stop Playback
+              </button>
+            )}
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <label>Smoothing: {(smoothingStrength * 100).toFixed(0)}%</label>
+            <input
+              type="range"
+              min="0"
+              max="0.8"
+              step="0.05"
+              value={smoothingStrength}
+              onChange={(e) => setSmoothingStrength(Number(e.target.value))}
+            />
+            <button
+              onClick={applyAnimationSmoothing}
+              title="Apply smoothing to recorded animation (makes movements more organic)"
+            >
+              Apply Smoothing
+            </button>
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <label>Export Resolution:</label>
+            <div className="resolution-selector">
+              {[1, 2, 4].map(res => (
+                <button
+                  key={res}
+                  onClick={() => setExportResolution(res)}
+                  className={exportResolution === res ? 'active' : ''}
+                  disabled={isExportingVideo}
+                  title={`${res}x resolution (${canvasRef.current ? canvasRef.current.width * res : '?'}x${canvasRef.current ? canvasRef.current.height * res : '?'})`}
+                >
+                  {res}x
+                </button>
+              ))}
+            </div>
+            <span className="resolution-info">
+              {canvasRef.current ? `${canvasRef.current.width * exportResolution}×${canvasRef.current.height * exportResolution}` : ''}
+            </span>
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group camera-controls">
+            <div className="camera-header">
+              <label>Camera:</label>
+              <button
+                onClick={() => setShowCameraPreview(!showCameraPreview)}
+                className={showCameraPreview ? 'active small' : 'small'}
+                title="Toggle camera preview overlay"
+              >
+                {showCameraPreview ? '👁 Hide' : '👁 Preview'}
+              </button>
+            </div>
+            
+            <label>Zoom: {exportCameraZoom.toFixed(1)}x</label>
+            <input
+              type="range"
+              min="0.5"
+              max="4"
+              step="0.1"
+              value={exportCameraZoom}
+              onChange={(e) => setExportCameraZoom(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <label>Pan X: {exportCameraPanX.toFixed(0)}%</label>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              step="1"
+              value={exportCameraPanX}
+              onChange={(e) => setExportCameraPanX(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <label>Pan Y: {exportCameraPanY.toFixed(0)}%</label>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              step="1"
+              value={exportCameraPanY}
+              onChange={(e) => setExportCameraPanY(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <button
+              onClick={() => {
+                setExportCameraZoom(1);
+                setExportCameraPanX(0);
+                setExportCameraPanY(0);
+              }}
+              disabled={isExportingVideo || (exportCameraZoom === 1 && exportCameraPanX === 0 && exportCameraPanY === 0)}
+              title="Reset camera to default"
+            >
+              Reset Camera
+            </button>
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <button
+              onClick={exportAnimationVideo}
+              disabled={isExportingVideo}
+              className="active"
+              title="Export animation as PNG sequence (ZIP) for After Effects"
+            >
+              {isExportingVideo ? 'Exporting...' : '🎬 Export PNG Sequence'}
+            </button>
+            {exportProgress && isExportingVideo && (
+              <div className="export-progress">
+                <div 
+                  className="export-progress-bar"
+                  style={{ width: `${exportProgress.progress}%` }}
+                />
+                <span className="export-progress-text">
+                  {exportProgress.message}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {(hasAnimation || isRecording) && (
+          <div className="control-group button-row">
+            <button
+              onClick={saveCurrentAnimation}
+              disabled={isRecording}
+              title="Save animation to file"
+            >
+              Save
+            </button>
+            <button
+              onClick={loadAnimation}
+              disabled={isRecording || isPlayingAnimation}
+              title="Load animation from file"
+            >
+              Load
+            </button>
+            <button
+              onClick={clearAnimation}
+              disabled={isRecording || isPlayingAnimation}
+              className="danger"
+              title="Clear recorded animation"
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
+        {!hasAnimation && !isRecording && (
+          <div className="control-group">
+            <button
+              onClick={loadAnimation}
+              title="Load animation from file"
+            >
+              Load Animation
+            </button>
+          </div>
+        )}
 
         <h2>Project</h2>
 
@@ -1210,6 +2132,8 @@ function App() {
                   floorY: system.config.floorY,
                   wallsEnabled: system.config.wallsEnabled,
                   damping: system.config.damping,
+                  collisionIterations,
+                  restitution,
                 },
                 {
                   brushSize,
@@ -1220,6 +2144,8 @@ function App() {
                 },
                 palette,
                 selectedSwatch,
+                bgPalette,
+                selectedBgSwatch,
                 projectName
               );
             }}
@@ -1251,6 +2177,14 @@ function App() {
               setGravity(data.physics.gravityEnabled);
               setFloor(data.physics.floorEnabled);
               
+              // Restore collision settings
+              if (data.physics.collisionIterations !== undefined) {
+                setCollisionIterations(data.physics.collisionIterations);
+              }
+              if (data.physics.restitution !== undefined) {
+                setRestitution(data.physics.restitution);
+              }
+              
               // Restore other settings
               setBrushSize(data.settings.brushSize);
               setStickyMode(data.settings.stickyEnabled);
@@ -1266,6 +2200,18 @@ function App() {
               // Restore palette
               setPalette(data.palette);
               setSelectedSwatch(data.selectedSwatch);
+              
+              // Restore background palette
+              if (data.bgPalette) {
+                setBgPalette(data.bgPalette);
+              }
+              if (data.selectedBgSwatch !== undefined) {
+                setSelectedBgSwatch(data.selectedBgSwatch);
+              }
+              
+              // Initialize undo history with loaded state
+              undoManager.initialize(system.circles);
+              updateUndoRedoState();
               
               console.log(`Loaded project: ${data.name} (saved ${new Date(data.savedAt).toLocaleString()})`);
             }}
@@ -1290,6 +2236,63 @@ function App() {
             value={brushSize}
             onChange={(e) => setBrushSize(Number(e.target.value))}
           />
+        </div>
+
+        <h2>Background</h2>
+
+        <div className="control-group">
+          <div className="swatch-row">
+            {bgPalette.map((color, i) => (
+              <div
+                key={i}
+                className={`swatch ${selectedBgSwatch === i ? 'selected' : ''}`}
+                style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                onClick={() => setSelectedBgSwatch(i)}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="control-group">
+          <label>Hue: {bgPalette[selectedBgSwatch].h}</label>
+          <input
+            type="range"
+            min="0"
+            max="360"
+            value={bgPalette[selectedBgSwatch].h}
+            onChange={(e) => updateBgPalette('h', Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Saturation: {bgPalette[selectedBgSwatch].s}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={bgPalette[selectedBgSwatch].s}
+            onChange={(e) => updateBgPalette('s', Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Lightness: {bgPalette[selectedBgSwatch].l}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={bgPalette[selectedBgSwatch].l}
+            onChange={(e) => updateBgPalette('l', Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={resetBgPalette}
+            title="Reset background palette to defaults"
+          >
+            Reset Backgrounds
+          </button>
         </div>
 
         <h2>Color</h2>
@@ -1340,10 +2343,57 @@ function App() {
           />
         </div>
 
+        <div className="control-group">
+          <button
+            onClick={resetCirclePalette}
+            title="Reset circle palette to defaults"
+          >
+            Reset Colors
+          </button>
+        </div>
+
+        <div className="control-group button-row">
+          <button
+            onClick={savePalettes}
+            title="Save both palettes to file"
+          >
+            Save Palettes
+          </button>
+          <button
+            onClick={loadPalettes}
+            title="Load palettes from file"
+          >
+            Load Palettes
+          </button>
+        </div>
+
         <h2>Tools</h2>
 
-        <div className="control-group">
-          <button onClick={() => { clear(); clearSelection(); }}>Clear All</button>
+        <div className="control-group button-row">
+          <button 
+            onClick={() => { 
+              saveUndoState(true);
+              clear(); 
+              clearSelection(); 
+              saveUndoState(true);
+            }}
+          >
+            Clear All
+          </button>
+          <button 
+            onClick={performUndo}
+            disabled={!canUndo}
+            title="Undo (Ctrl+Z)"
+          >
+            ↶ Undo
+          </button>
+          <button 
+            onClick={performRedo}
+            disabled={!canRedo}
+            title="Redo (Ctrl+Y)"
+          >
+            ↷ Redo
+          </button>
         </div>
 
         <div className="control-group">
@@ -1384,7 +2434,7 @@ function App() {
           </button>
         </div>
 
-        <div className="control-group">
+        <div className="control-group button-row">
           <button
             onClick={() => {
               setLockMode(!lockMode);
@@ -1393,6 +2443,12 @@ function App() {
             className={lockMode ? "active warning" : ""}
           >
             Lock {lockMode ? "ON" : "OFF"}
+          </button>
+          <button
+            onClick={unlockAll}
+            title="Unlock all circles"
+          >
+            Unlock All
           </button>
         </div>
 
@@ -1431,8 +2487,16 @@ function App() {
               <button onClick={deleteSelection} className="danger" title="Delete selected circles">
                 Delete
               </button>
-              <button onClick={clearSelection} title="Clear selection">
-                Deselect
+              <button onClick={invertSelection} title="Invert selection">
+                Invert
+              </button>
+            </div>
+            <div className="button-row">
+              <button onClick={lockInverse} title="Lock all circles that are NOT selected">
+                Lock Inverse
+              </button>
+              <button onClick={unlockAll} title="Unlock all circles">
+                Unlock All
               </button>
             </div>
           </div>
@@ -1489,6 +2553,16 @@ function App() {
 
         <div className="control-group">
           <button
+            onClick={() => setPhysicsPaused(!physicsPaused)}
+            className={physicsPaused ? "active warning" : ""}
+            title={physicsPaused ? "Resume physics simulation" : "Pause physics (use if app becomes unresponsive)"}
+          >
+            {physicsPaused ? "▶ Resume" : "⏸ Pause"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
             onClick={() => setGravity(!config.gravityEnabled)}
             className={config.gravityEnabled ? "active" : ""}
           >
@@ -1512,6 +2586,30 @@ function App() {
           >
             Floor {config.floorEnabled ? "ON" : "OFF"}
           </button>
+        </div>
+
+        <div className="control-group">
+          <label>Collision Accuracy: {collisionIterations}</label>
+          <input
+            type="range"
+            min="1"
+            max="8"
+            step="1"
+            value={collisionIterations}
+            onChange={(e) => setCollisionIterations(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Bounciness: {restitution.toFixed(2)}</label>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={restitution}
+            onChange={(e) => setRestitution(Number(e.target.value))}
+          />
         </div>
 
         <h2>Forces</h2>
@@ -1567,6 +2665,21 @@ function App() {
 
       {/* Canvas Area */}
       <main className="canvas-container">
+        {isRecording && (
+          <div className="recording-indicator">
+            REC {(recordingDuration / 1000).toFixed(1)}s
+          </div>
+        )}
+        {isPlayingAnimation && (
+          <div className="playback-indicator">
+            ▶ Playing
+          </div>
+        )}
+        {isExportingVideo && (
+          <div className="exporting-indicator">
+            🎬 Exporting {exportResolution}x... {exportProgress?.progress || 0}%
+          </div>
+        )}
         <canvas
           ref={canvasRef}
           style={{ cursor: eraseMode ? 'not-allowed' : lockMode ? 'pointer' : recolorMode ? 'cell' : selectMode ? 'crosshair' : magnetMode !== 'off' ? 'move' : flowMode === 'draw' ? 'crosshair' : flowMode === 'erase' ? 'not-allowed' : 'crosshair' }}

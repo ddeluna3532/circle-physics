@@ -33,13 +33,14 @@
     },
     "windows": [
       {
-        "fullscreen": false,
+        "fullscreen": true,
         "resizable": true,
         "title": "Circle Physics",
         "width": 1400,
         "height": 900,
         "minWidth": 800,
-        "minHeight": 600
+        "minHeight": 600,
+        "decorations": true
       }
     ]
   }

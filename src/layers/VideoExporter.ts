@@ -4,12 +4,17 @@ export interface ExportOptions {
   fps: number;
   quality: number; // 0-1 for JPEG, ignored for PNG
   format: 'png' | 'jpeg';
+  motionBlur?: boolean; // Enable motion blur
+  motionBlurSamples?: number; // Number of sub-frames to blend (default: 5)
+  shutterAngle?: number; // 0-360 degrees (default: 180, which is 50% of frame time)
 }
 
 export interface VideoExportProgress {
   phase: 'preparing' | 'rendering' | 'encoding' | 'complete' | 'error';
   progress: number; // 0-100
   message: string;
+  currentFrame?: number;
+  totalFrames?: number;
 }
 
 export type ProgressCallback = (progress: VideoExportProgress) => void;
@@ -173,6 +178,65 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
   });
 }
 
+// Render frame with motion blur by blending multiple sub-frames
+async function renderFrameWithMotionBlur(
+  canvas: HTMLCanvasElement,
+  renderFrame: (time: number) => void,
+  centerTime: number,
+  frameInterval: number,
+  samples: number,
+  shutterAngle: number
+): Promise<void> {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  
+  // If only 1 sample, just render normally without blur
+  if (samples <= 1) {
+    renderFrame(centerTime);
+    return;
+  }
+  
+  // Calculate time window for motion blur
+  // shutterAngle of 180 degrees = 50% of frame time (standard cinematic)
+  // shutterAngle of 360 degrees = 100% of frame time (maximum blur)
+  const shutterFraction = shutterAngle / 360;
+  const timeWindow = frameInterval * shutterFraction;
+  
+  // Create accumulation buffer
+  const width = canvas.width;
+  const height = canvas.height;
+  const accumBuffer = new Float32Array(width * height * 4); // RGBA
+  
+  // Render and accumulate sub-frames
+  for (let i = 0; i < samples; i++) {
+    // Distribute samples evenly across the time window
+    // Center the samples around centerTime
+    const t = (i / (samples - 1)) - 0.5; // -0.5 to 0.5
+    const sampleTime = centerTime + (t * timeWindow);
+    
+    // Render this sub-frame
+    renderFrame(sampleTime);
+    
+    // Get pixel data
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const pixels = imageData.data;
+    
+    // Accumulate into buffer
+    for (let j = 0; j < pixels.length; j++) {
+      accumBuffer[j] += pixels[j];
+    }
+  }
+  
+  // Average the accumulated samples
+  const imageData = ctx.createImageData(width, height);
+  for (let i = 0; i < accumBuffer.length; i++) {
+    imageData.data[i] = Math.round(accumBuffer[i] / samples);
+  }
+  
+  // Put the blurred frame back
+  ctx.putImageData(imageData, 0, 0);
+}
+
 // Export as PNG image sequence (ZIP file)
 // This is the recommended format for After Effects
 export async function exportVideoHighQuality(
@@ -183,13 +247,20 @@ export async function exportVideoHighQuality(
   onProgress?: ProgressCallback
 ): Promise<Blob | null> {
   const fps = options.fps || 30;
+  const motionBlur = options.motionBlur || false;
+  const motionBlurSamples = options.motionBlurSamples || 5;
+  const shutterAngle = options.shutterAngle || 180;
   const frameInterval = 1000 / fps;
   const totalFrames = Math.ceil(duration / frameInterval);
   
   onProgress?.({
     phase: 'preparing',
     progress: 0,
-    message: 'Preparing PNG sequence export...',
+    message: motionBlur 
+      ? `Preparing PNG sequence with motion blur (${motionBlurSamples} samples)...`
+      : 'Preparing PNG sequence export...',
+    currentFrame: 0,
+    totalFrames,
   });
   
   const zip = new SimpleZip();
@@ -198,8 +269,19 @@ export async function exportVideoHighQuality(
     for (let i = 0; i < totalFrames; i++) {
       const time = i * frameInterval;
       
-      // Render the frame
-      renderFrame(time);
+      // Render the frame (with or without motion blur)
+      if (motionBlur) {
+        await renderFrameWithMotionBlur(
+          canvas,
+          renderFrame,
+          time,
+          frameInterval,
+          motionBlurSamples,
+          shutterAngle
+        );
+      } else {
+        renderFrame(time);
+      }
       
       // Convert to PNG
       const pngData = await canvasToPngBytes(canvas);
@@ -210,14 +292,18 @@ export async function exportVideoHighQuality(
       
       // Update progress
       const progress = Math.round(((i + 1) / totalFrames) * 95);
+      const blurInfo = motionBlur ? ` (${motionBlurSamples}x blur)` : '';
       onProgress?.({
         phase: 'rendering',
         progress,
-        message: `Rendering frame ${i + 1}/${totalFrames}...`,
+        message: `Rendering frame ${i + 1}/${totalFrames}${blurInfo}...`,
+        currentFrame: i + 1,
+        totalFrames,
       });
       
-      // Yield to prevent UI blocking
-      if (i % 5 === 0) {
+      // Yield to prevent UI blocking (more frequently with motion blur)
+      const yieldInterval = motionBlur ? 1 : 5;
+      if (i % yieldInterval === 0) {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
@@ -226,6 +312,8 @@ export async function exportVideoHighQuality(
       phase: 'encoding',
       progress: 98,
       message: 'Creating ZIP archive...',
+      currentFrame: totalFrames,
+      totalFrames,
     });
     
     const blob = zip.generate();
@@ -234,6 +322,8 @@ export async function exportVideoHighQuality(
       phase: 'complete',
       progress: 100,
       message: 'Export complete!',
+      currentFrame: totalFrames,
+      totalFrames,
     });
     
     return blob;
@@ -244,6 +334,8 @@ export async function exportVideoHighQuality(
       phase: 'error',
       progress: 0,
       message: `Export failed: ${err}`,
+      currentFrame: 0,
+      totalFrames,
     });
     return null;
   }

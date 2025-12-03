@@ -1,0 +1,1580 @@
+
+>     return () => cancelAnimationFrame(animationRef.current);
+    }, [system, render, applyMagnet, applyNBodyForce, applyStickyForce, applyScaling, applyRandomScaling, autoSpawn, autoSpawnRandom, physicsPaused, isRecording, isPlayingAnimation, animationRecorder]);
+  
+    // Handle canvas resize
+    useEffect(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+  
+      const resize = () => {
+        const container = canvas.parentElement;
+        if (!container) return;
+        
+        // Parse aspect ratio
+        const parts = aspectRatio.split(':');
+        const ratioW = parseFloat(parts[0]) || 4;
+        const ratioH = parseFloat(parts[1]) || 3;
+        const targetRatio = ratioW / ratioH;
+        
+        const containerW = container.clientWidth;
+        const containerH = container.clientHeight;
+        const containerRatio = containerW / containerH;
+        
+        let canvasW, canvasH;
+        if (containerRatio > targetRatio) {
+          // Container is wider than target, fit to height
+          canvasH = containerH;
+          canvasW = containerH * targetRatio;
+        } else {
+          // Container is taller than target, fit to width
+          canvasW = containerW;
+          canvasH = containerW / targetRatio;
+        }
+        
+        canvas.width = canvasW;
+        canvas.height = canvasH;
+        setBounds(0, 0, canvas.width, canvas.height);
+        
+        // Resize all paint layers
+        resizeAllPaintLayers(canvasW, canvasH);
+  
+        // Update floor position relative to canvas
+        system.config.floorY = canvas.height - 50;
+      };
+  
+      resize();
+      window.addEventListener("resize", resize);
+>     return () => window.removeEventListener("resize", resize);
+    }, [setBounds, system, aspectRatio, resizeAllPaintLayers]);
+  
+    // Keyboard shortcuts for selection, physics, undo/redo, and animation
+    useEffect(() => {
+      const handleKeyDown = (e: KeyboardEvent) => {
+        // Don't trigger shortcuts if typing in an input
+        const isInput = e.target instanceof HTMLInputElement;
+        
+        // Undo - Ctrl+Z (works even in inputs for consistency)
+        if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+          e.preventDefault();
+          performUndo();
+          return;
+        }
+        
+        // Redo - Ctrl+Y or Ctrl+Shift+Z
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+          e.preventDefault();
+          performRedo();
+          return;
+        }
+        
+        if (isInput) return;
+        
+        // Delete key - delete selected circles
+        if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0) {
+          e.preventDefault();
+          deleteSelection();
+          saveUndoState(true);
+        }
+        // Escape - clear selection, exit select mode, or stop animation
+        if (e.key === 'Escape') {
+          if (isPlayingAnimation) {
+            stopAnimation();
+          } else if (isRecording) {
+            stopRecording();
+          } else if (selectedIds.size > 0) {
+            clearSelection();
+          } else if (selectMode) {
+            setSelectMode(false);
+          }
+        }
+        // P or Space - toggle physics pause (not during animation)
+        if (e.key === 'p' || e.key === 'P' || e.key === ' ') {
+          if (isPlayingAnimation) return;
+          e.preventDefault();
+          setPhysicsPaused(prev => !prev);
+        }
+        // R - toggle recording
+        if (e.key === 'r' || e.key === 'R') {
+          if (isPlayingAnimation) return;
+          e.preventDefault();
+          if (isRecording) {
+            stopRecording();
+          } else {
+            startRecording();
+          }
+        }
+      };
+  
+      window.addEventListener('keydown', handleKeyDown);
+>     return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selectedIds, deleteSelection, clearSelection, selectMode, performUndo, performRedo, saveUndoState, isRecording, isPlayingAnimation, startRecording, stopRecording, stopAnimation]);
+  
+    // Get canvas-relative coordinates from mouse or touch event
+    const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return { x: 0, y: 0 };
+      const rect = canvas.getBoundingClientRect();
+      
+      // Handle touch events
+      if ('touches' in e) {
+        const touch = e.touches[0] || e.changedTouches[0];
+        return {
+          x: touch.clientX - rect.left,
+          y: touch.clientY - rect.top,
+        };
+      }
+      
+      // Handle mouse events
+      return {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      };
+    };
+  
+    // Get distance between two touch points
+    const getTouchDistance = (e: React.TouchEvent<HTMLCanvasElement>): number => {
+      if (e.touches.length < 2) return 0;
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      const dx = t2.clientX - t1.clientX;
+      const dy = t2.clientY - t1.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+  
+    // Pointer down handler (mouse or touch)
+    const handlePointerDown = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+      // Prevent scrolling on touch
+      if ('touches' in e) {
+        e.preventDefault();
+        
+        // Check for second finger added (start pinch-to-scale)
+        if (e.touches.length === 2 && draggingRef.current) {
+          // Use the circle we were already dragging
+          pinchRef.current = {
+            circle: draggingRef.current,
+            initialDistance: getTouchDistance(e),
+            initialRadius: draggingRef.current.r,
+          };
+          // Stop dragging, switch to scaling
+          draggingRef.current.isDragging = false;
+          draggingRef.current = null;
+          setDragging(null);
+          isPaintingRef.current = false;
+          console.log("pinch started on circle, initial radius:", pinchRef.current.circle.r);
+          return;
+        }
+        
+        // If already pinching, ignore additional touches
+        if (pinchRef.current.circle) {
+          return;
+        }
+      }
+      
+      const { x, y } = getCanvasCoords(e);
+      console.log("pointerDown at", x, y);
+      
+      // Initialize mouse tracking
+      mouseRef.current = { x, y, prevX: x, prevY: y };
+  
+      // Check if clicking existing circle
+      const hit = getCircleAt(x, y);
+      console.log("hit circle?", hit);
+      
+      // Erase mode
+      if (eraseMode) {
+        isErasingRef.current = true;
+        erasedThisStroke.current.clear();
+        if (hit) {
+          removeCircle(hit.id);
+          erasedThisStroke.current.add(hit.id);
+          console.log("erased circle");
+        }
+        return;
+      }
+      
+      // Lock mode
+      if (lockMode) {
+        isLockingRef.current = true;
+        lockedThisStroke.current.clear();
+        if (hit) {
+          hit.locked = !hit.locked;
+          lockedThisStroke.current.add(hit.id);
+          console.log("toggled lock:", hit.locked);
+        }
+        return;
+      }
+      
+      // Recolor mode
+      if (recolorMode) {
+        isRecoloringRef.current = true;
+        recoloredThisStroke.current.clear();
+        if (hit && isCircleModifiable(hit)) {
+          hit.color = getRandomPaletteColor();
+          recoloredThisStroke.current.add(hit.id);
+          console.log("recolored circle");
+        }
+        return;
+      }
+      
+      // Flow field mode
+      if (flowMode === 'draw') {
+        isFlowDrawingRef.current = true;
+        flowStartRef.current = { x, y };
+        lastFlowPosRef.current = { x, y };
+        console.log("flow draw started at", x, y);
+        return;
+      }
+      
+      if (flowMode === 'erase') {
+        system.removeFlowVectorAt(x, y);
+        console.log("flow erase at", x, y);
+        return;
+      }
+      
+      // Magnet mode
+      if (magnetMode !== 'off') {
+        isMagnetActiveRef.current = true;
+        magnetPosRef.current = { x, y };
+        console.log("magnet activated at", x, y);
+        return;
+      }
+      
+      // Selection mode
+      if (selectMode) {
+        // Check if clicking on an already selected circle (to drag selection)
+        if (isClickOnSelection(x, y)) {
+          isDraggingSelectionRef.current = true;
+          selectionDragStartRef.current = { x, y };
+          console.log("started dragging selection");
+          return;
+        }
+        
+        // Check if clicking on an unselected circle (start paint selection)
+        if (hit) {
+          // Start paint selection mode
+          isPaintSelectingRef.current = true;
+          paintSelectedThisStroke.current = new Set();
+          
+          // Shift+click to add to selection, otherwise replace selection
+          if ((e as React.MouseEvent).shiftKey) {
+            setSelectedIds(prev => {
+              const next = new Set(prev);
+              next.add(hit.id);
+              paintSelectedThisStroke.current.add(hit.id);
+              return next;
+            });
+          } else {
+            setSelectedIds(new Set([hit.id]));
+            paintSelectedThisStroke.current.add(hit.id);
+          }
+          console.log("started paint selection with circle", hit.id);
+          return;
+        }
+        
+        // Start marquee selection
+        isSelectingRef.current = true;
+        selectionStartRef.current = { x, y };
+        selectionRectRef.current = { x, y, w: 0, h: 0 };
+        if (!(e as React.MouseEvent).shiftKey) {
+          setSelectedIds(new Set()); // Clear selection if not shift-clicking
+        }
+        console.log("started marquee selection at", x, y);
+        return;
+      }
+      
+      // Get active layer for drawing
+      const activeLayer = getActiveLayer();
+      
+      // Paint mode on paint layer
+      if (paintMode && activeLayer?.type === 'paint') {
+        const paintLayer = activeLayer as PaintLayer;
+        if (paintLayer.ctx && !activeLayer.locked) {
+          isPaintingLayerRef.current = true;
+          lastPaintPosRef.current = { x, y };
+          brush.stroke(paintLayer.ctx, x, y, getColor());
+          console.log("paint layer stroke started at", x, y);
+        }
+        return;
+      }
+      
+      // Circle layer mode
+      if (activeLayer?.type === 'circles' && !activeLayer.locked) {
+        if (hit && isCircleModifiable(hit)) {
+          hit.isDragging = true;
+          draggingRef.current = hit;
+          setDragging(hit);
+          console.log("started dragging circle");
+        } else if (!hit) {
+          // Start painting mode and add first circle
+          isPaintingRef.current = true;
+          const added = addCircle(x, y, brushSize, getColor(), activeLayer.id);
+          console.log("started painting, first circle added:", added);
+        }
+      }
+    };
+  
+    const handlePointerMove = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+      // Prevent scrolling on touch
+      if ('touches' in e) {
+        e.preventDefault();
+        
+        // Handle pinch gesture
+        if (e.touches.length === 2 && pinchRef.current.circle) {
+          // Don't scale if circle became unmodifiable (e.g., layer locked mid-pinch)
+          if (!isCircleModifiable(pinchRef.current.circle)) {
+            pinchRef.current = { circle: null, initialDistance: 0, initialRadius: 0 };
+            return;
+          }
+          const newDistance = getTouchDistance(e);
+          const scale = newDistance / pinchRef.current.initialDistance;
+          const newRadius = Math.max(5, Math.min(200, pinchRef.current.initialRadius * scale));
+          pinchRef.current.circle.r = newRadius;
+          pinchRef.current.circle.mass = newRadius * newRadius;
+          console.log("pinch scale:", scale.toFixed(2), "new radius:", newRadius.toFixed(1));
+          return;
+        }
+      }
+      
+      const { x, y } = getCanvasCoords(e);
+      
+      // Erase mode - delete circles as we drag over them
+      if (isErasingRef.current) {
+        const hit = getCircleAt(x, y);
+        if (hit && !erasedThisStroke.current.has(hit.id)) {
+          removeCircle(hit.id);
+          erasedThisStroke.current.add(hit.id);
+          console.log("erased circle while dragging");
+        }
+        return;
+      }
+      
+      // Lock mode - toggle lock on circles as we drag over them
+      if (isLockingRef.current) {
+        const hit = getCircleAt(x, y);
+        if (hit && !lockedThisStroke.current.has(hit.id)) {
+          hit.locked = !hit.locked;
+          lockedThisStroke.current.add(hit.id);
+          console.log("toggled lock while dragging:", hit.locked);
+        }
+        return;
+      }
+      
+      // Recolor mode - recolor circles as we drag over them
+      if (isRecoloringRef.current) {
+        const hit = getCircleAt(x, y);
+        if (hit && isCircleModifiable(hit) && !recoloredThisStroke.current.has(hit.id)) {
+          hit.color = getRandomPaletteColor();
+          recoloredThisStroke.current.add(hit.id);
+          console.log("recolored circle while dragging");
+        }
+        return;
+      }
+      
+      // Flow field drawing - add vectors based on drag direction
+      if (isFlowDrawingRef.current) {
+        const dx = x - lastFlowPosRef.current.x;
+        const dy = y - lastFlowPosRef.current.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        
+        // Only add vector if we've moved enough
+        if (dist > 30) {
+          const angle = Math.atan2(dy, dx);
+          system.addFlowVector(lastFlowPosRef.current.x, lastFlowPosRef.current.y, angle);
+          lastFlowPosRef.current = { x, y };
+        }
+        return;
+      }
+      
+      // Flow field erase - remove vectors while dragging
+      if (flowMode === 'erase') {
+        system.removeFlowVectorAt(x, y);
+        return;
+      }
+      
+      // Magnet mode - update position while dragging
+      if (isMagnetActiveRef.current) {
+        magnetPosRef.current = { x, y };
+        return;
+      }
+      
+      // Selection mode - update marquee or drag selection
+      if (isSelectingRef.current) {
+        // Update marquee rectangle
+        selectionRectRef.current = {
+          x: selectionStartRef.current.x,
+          y: selectionStartRef.current.y,
+          w: x - selectionStartRef.current.x,
+          h: y - selectionStartRef.current.y,
+        };
+        return;
+      }
+      
+      // Paint selection mode - add circles under cursor to selection
+      if (isPaintSelectingRef.current) {
+        const hit = getCircleAt(x, y);
+        if (hit && !paintSelectedThisStroke.current.has(hit.id)) {
+          setSelectedIds(prev => {
+            const next = new Set(prev);
+            next.add(hit.id);
+            return next;
+          });
+          paintSelectedThisStroke.current.add(hit.id);
+        }
+        return;
+      }
+      
+      if (isDraggingSelectionRef.current) {
+        // Move all selected circles
+        const dx = x - selectionDragStartRef.current.x;
+        const dy = y - selectionDragStartRef.current.y;
+        moveSelection(dx, dy);
+        selectionDragStartRef.current = { x, y };
+        return;
+      }
+      
+      // Paint layer mode - draw continuous strokes
+      if (isPaintingLayerRef.current) {
+        const activeLayer = getActiveLayer();
+        if (activeLayer?.type === 'paint') {
+          const paintLayer = activeLayer as PaintLayer;
+          if (paintLayer.ctx) {
+            interpolateStroke(
+              brush,
+              paintLayer.ctx,
+              lastPaintPosRef.current.x,
+              lastPaintPosRef.current.y,
+              x,
+              y,
+              getColor()
+            );
+            lastPaintPosRef.current = { x, y };
+          }
+        }
+        return;
+      }
+      
+      // Calculate velocity before updating positions
+      const vx = (x - mouseRef.current.x) * 0.5;
+      const vy = (y - mouseRef.current.y) * 0.5;
+      
+      // Update mouse tracking
+      mouseRef.current.prevX = mouseRef.current.x;
+      mouseRef.current.prevY = mouseRef.current.y;
+      mouseRef.current.x = x;
+      mouseRef.current.y = y;
+  
+      if (draggingRef.current) {
+        // Move dragged circle
+        draggingRef.current.x = x;
+        draggingRef.current.y = y;
+        // Store velocity for momentum on release
+        draggingRef.current.vx = vx;
+        draggingRef.current.vy = vy;
+      } else if (isPaintingRef.current) {
+        // Continuously spawn circles while dragging
+        const activeLayer = getActiveLayer();
+        if (activeLayer?.type === 'circles') {
+          const added = addCircle(x, y, brushSize, getColor(), activeLayer.id);
+          if (added) console.log("painted circle at", x, y);
+        }
+      }
+    };
+  
+    const handlePointerUp = (e?: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+      // Track if we made changes that need undo save
+      let madeChanges = false;
+      
+      // Clear pinch state
+      if (pinchRef.current.circle) {
+        console.log("pinch ended, final radius:", pinchRef.current.circle.r);
+        pinchRef.current = { circle: null, initialDistance: 0, initialRadius: 0 };
+        madeChanges = true;
+      }
+      
+      // Clear erase state
+      if (isErasingRef.current) {
+        madeChanges = true;
+      }
+      isErasingRef.current = false;
+      
+      // Clear lock state
+      isLockingRef.current = false;
+      
+      // Clear recolor state
+      if (isRecoloringRef.current) {
+        madeChanges = true;
+      }
+      isRecoloringRef.current = false;
+      
+      // Clear magnet state
+      isMagnetActiveRef.current = false;
+      
+      // Clear paint layer state
+      isPaintingLayerRef.current = false;
+      
+      // Clear flow drawing state (add final vector if moved enough)
+      if (isFlowDrawingRef.current) {
+        isFlowDrawingRef.current = false;
+      }
+      
+      // Handle selection completion
+      if (isSelectingRef.current && selectionRectRef.current) {
+        const r = selectionRectRef.current;
+        const circlesInRect = getCirclesInRect(r.x, r.y, r.w, r.h);
+        
+        // Add to selection (shift key) or replace
+        if ((e as React.MouseEvent)?.shiftKey) {
+          setSelectedIds(prev => {
+            const next = new Set(prev);
+            for (const c of circlesInRect) {
+              next.add(c.id);
+            }
+            return next;
+          });
+        } else {
+          setSelectedIds(new Set(circlesInRect.map(c => c.id)));
+        }
+        
+        console.log("selected", circlesInRect.length, "circles");
+        selectionRectRef.current = null;
+        isSelectingRef.current = false;
+      }
+      
+      // Clear selection drag state
+      if (isDraggingSelectionRef.current) {
+        madeChanges = true;
+      }
+      isDraggingSelectionRef.current = false;
+      
+      // Clear paint selection state
+      if (isPaintSelectingRef.current) {
+        console.log("paint selected", paintSelectedThisStroke.current.size, "circles");
+      }
+      isPaintSelectingRef.current = false;
+      paintSelectedThisStroke.current.clear();
+      
+      console.log("pointerUp, wasDragging:", !!draggingRef.current, "wasPainting:", isPaintingRef.current);
+      
+      if (draggingRef.current) {
+        // Release with momentum (velocity already set in handlePointerMove)
+        console.log("releasing with velocity:", draggingRef.current.vx, draggingRef.current.vy);
+        draggingRef.current.isDragging = false;
+        draggingRef.current = null;
+        setDragging(null);
+        madeChanges = true;
+      }
+      
+      if (isPaintingRef.current) {
+        madeChanges = true;
+      }
+      isPaintingRef.current = false;
+      
+      // Save undo state if we made changes
+      if (madeChanges) {
+        saveUndoState(true);
+      }
+    };
+  
+>   return (
+      <div className="app">
+        {/* Left Panel */}
+        <aside className="panel left-panel">
+          <h2>Canvas</h2>
+  
+          <div className="control-group">
+            <label>Aspect Ratio</label>
+            <input
+              type="text"
+              value={aspectRatio}
+              onChange={(e) => setAspectRatio(e.target.value)}
+              placeholder="4:3"
+              className="aspect-input"
+            />
+          </div>
+  
+          <h2>Export</h2>
+  
+          <div className="control-group button-row">
+            <button 
+              onClick={() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const link = document.createElement('a');
+                link.download = `circles-${Date.now()}.png`;
+                link.href = canvas.toDataURL('image/png');
+                link.click();
+              }}
+              title="Export canvas as PNG image"
+            >
+              PNG
+            </button>
+            <button 
+              onClick={() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                exportSVG(system.circles, canvas.width, canvas.height, layers, {
+                  backgroundColor: getBackgroundHex(),
+                  stencilMargin: 10,
+                  includeStencilLayers: true,
+                });
+              }}
+              title="Export as multi-layered SVG (includes stencil layers for cutting)"
+            >
+              SVG
+            </button>
+          </div>
+  
+          <h2>Animation</h2>
+  
+          <div className="control-group">
+            {!isRecording && !isPlayingAnimation && (
+              <button
+                onClick={startRecording}
+                className="danger"
+                title="Start recording animation (R)"
+              >
+                ⏺ Record
+              </button>
+            )}
+            {isRecording && (
+              <button
+                onClick={stopRecording}
+                className="active danger"
+                title="Stop recording (R or Escape)"
+              >
+                ⏹ Stop ({(recordingDuration / 1000).toFixed(1)}s, {recordingFrames} frames)
+              </button>
+            )}
+          </div>
+  
+          {hasAnimation && !isRecording && (
+            <div className="control-group">
+              {!isPlayingAnimation ? (
+                <button
+                  onClick={playAnimation}
+                  className="active"
+                  title="Play recorded animation"
+                >
+                  ▶ Play ({(animationDuration / 1000).toFixed(1)}s)
+                </button>
+              ) : (
+                <button
+                  onClick={stopAnimation}
+                  className="active warning"
+                  title="Stop playback (Escape)"
+                >
+                  ⏹ Stop Playback
+                </button>
+              )}
+            </div>
+          )}
+  
+          {hasAnimation && !isRecording && !isPlayingAnimation && (
+            <div className="control-group">
+              <label>Smoothing: {(smoothingStrength * 100).toFixed(0)}%</label>
+              <input
+                type="range"
+                min="0"
+                max="0.8"
+                step="0.05"
+                value={smoothingStrength}
+                onChange={(e) => setSmoothingStrength(Number(e.target.value))}
+              />
+              <button
+                onClick={applyAnimationSmoothing}
+                title="Apply smoothing to recorded animation (makes movements more organic)"
+              >
+                Apply Smoothing
+              </button>
+            </div>
+          )}
+  
+          {hasAnimation && !isRecording && !isPlayingAnimation && (
+            <div className="control-group">
+              <label>Export Resolution:</label>
+              <div className="resolution-selector">
+                {[1, 2, 4].map(res => (
+                  <button
+                    key={res}
+                    onClick={() => setExportResolution(res)}
+                    className={exportResolution === res ? 'active' : ''}
+                    disabled={isExportingVideo}
+                    title={`${res}x resolution (${canvasRef.current ? canvasRef.current.width * res : '?'}x${canvasRef.current ? canvasRef.current.height * res : '?'})`}
+                  >
+                    {res}x
+                  </button>
+                ))}
+              </div>
+              <span className="resolution-info">
+                {canvasRef.current ? `${canvasRef.current.width * exportResolution}×${canvasRef.current.height * exportResolution}` : ''}
+              </span>
+            </div>
+          )}
+  
+          {hasAnimation && !isRecording && !isPlayingAnimation && (
+            <div className="control-group camera-controls">
+              <div className="camera-header">
+                <label>Camera:</label>
+                <button
+                  onClick={() => setShowCameraPreview(!showCameraPreview)}
+                  className={showCameraPreview ? 'active small' : 'small'}
+                  title="Toggle camera preview overlay"
+                >
+                  {showCameraPreview ? '👁 Hide' : '👁 Preview'}
+                </button>
+              </div>
+              
+              <label>Zoom: {exportCameraZoom.toFixed(1)}x</label>
+              <input
+                type="range"
+                min="0.5"
+                max="4"
+                step="0.1"
+                value={exportCameraZoom}
+                onChange={(e) => setExportCameraZoom(Number(e.target.value))}
+                disabled={isExportingVideo}
+              />
+              
+              <label>Pan X: {exportCameraPanX.toFixed(0)}%</label>
+              <input
+                type="range"
+                min="-100"
+                max="100"
+                step="1"
+                value={exportCameraPanX}
+                onChange={(e) => setExportCameraPanX(Number(e.target.value))}
+                disabled={isExportingVideo}
+              />
+              
+              <label>Pan Y: {exportCameraPanY.toFixed(0)}%</label>
+              <input
+                type="range"
+                min="-100"
+                max="100"
+                step="1"
+                value={exportCameraPanY}
+                onChange={(e) => setExportCameraPanY(Number(e.target.value))}
+                disabled={isExportingVideo}
+              />
+              
+              <button
+                onClick={() => {
+                  setExportCameraZoom(1);
+                  setExportCameraPanX(0);
+                  setExportCameraPanY(0);
+                }}
+                disabled={isExportingVideo || (exportCameraZoom === 1 && exportCameraPanX === 0 && exportCameraPanY === 0)}
+                title="Reset camera to default"
+              >
+                Reset Camera
+              </button>
+            </div>
+          )}
+  
+          {hasAnimation && !isRecording && !isPlayingAnimation && (
+            <div className="control-group">
+              <button
+                onClick={exportAnimationVideo}
+                disabled={isExportingVideo}
+                className="active"
+                title="Export animation as PNG sequence (ZIP) for After Effects"
+              >
+                {isExportingVideo ? 'Exporting...' : '🎬 Export PNG Sequence'}
+              </button>
+              {exportProgress && isExportingVideo && (
+                <div className="export-progress">
+                  <div 
+                    className="export-progress-bar"
+                    style={{ width: `${exportProgress.progress}%` }}
+                  />
+                  <span className="export-progress-text">
+                    {exportProgress.message}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+  
+          {(hasAnimation || isRecording) && (
+            <div className="control-group button-row">
+              <button
+                onClick={saveCurrentAnimation}
+                disabled={isRecording}
+                title="Save animation to file"
+              >
+                Save
+              </button>
+              <button
+                onClick={loadAnimation}
+                disabled={isRecording || isPlayingAnimation}
+                title="Load animation from file"
+              >
+                Load
+              </button>
+              <button
+                onClick={clearAnimation}
+                disabled={isRecording || isPlayingAnimation}
+                className="danger"
+                title="Clear recorded animation"
+              >
+                Clear
+              </button>
+            </div>
+          )}
+  
+          {!hasAnimation && !isRecording && (
+            <div className="control-group">
+              <button
+                onClick={loadAnimation}
+                title="Load animation from file"
+              >
+                Load Animation
+              </button>
+            </div>
+          )}
+  
+          <h2>Project</h2>
+  
+          <div className="control-group button-row">
+            <button 
+              onClick={() => {
+                const projectName = prompt('Project name:', 'circles-project') || 'circles-project';
+                saveProject(
+                  system.circles,
+                  layers,
+                  activeLayerId,
+                  aspectRatio,
+                  {
+                    gravityEnabled: system.config.gravityEnabled,
+                    gravityStrength: system.config.gravityStrength,
+                    floorEnabled: system.config.floorEnabled,
+                    floorY: system.config.floorY,
+                    wallsEnabled: system.config.wallsEnabled,
+                    damping: system.config.damping,
+                    collisionIterations,
+                    restitution,
+                  },
+                  {
+                    brushSize,
+                    stickyEnabled: stickyMode,
+                    stickyStrength,
+                    clumpEnabled: nBodyMode === 'clump',
+                    spreadEnabled: nBodyMode === 'spread',
+                  },
+                  palette,
+                  selectedSwatch,
+                  bgPalette,
+                  selectedBgSwatch,
+                  projectName
+                );
+              }}
+              title="Save project to JSON file"
+            >
+              Save
+            </button>
+            <button 
+              onClick={async () => {
+                const data = await loadProject();
+                if (!data) return;
+                
+                // Restore circles
+                system.circles = restoreCircles(data);
+                
+                // Restore layers
+                restoreLayers(data.layers, data.activeLayerId);
+                
+                // Restore canvas settings
+                setAspectRatio(data.aspectRatio);
+                
+                // Restore physics
+                system.config.gravityEnabled = data.physics.gravityEnabled;
+                system.config.gravityStrength = data.physics.gravityStrength;
+                system.config.floorEnabled = data.physics.floorEnabled;
+                system.config.floorY = data.physics.floorY;
+                system.config.wallsEnabled = data.physics.wallsEnabled;
+                system.config.damping = data.physics.damping;
+                setGravity(data.physics.gravityEnabled);
+                setFloor(data.physics.floorEnabled);
+                
+                // Restore collision settings
+                if (data.physics.collisionIterations !== undefined) {
+                  setCollisionIterations(data.physics.collisionIterations);
+                }
+                if (data.physics.restitution !== undefined) {
+                  setRestitution(data.physics.restitution);
+                }
+                
+                // Restore other settings
+                setBrushSize(data.settings.brushSize);
+                setStickyMode(data.settings.stickyEnabled);
+                setStickyStrength(data.settings.stickyStrength);
+                if (data.settings.clumpEnabled) {
+                  setNBodyMode('clump');
+                } else if (data.settings.spreadEnabled) {
+                  setNBodyMode('spread');
+                } else {
+                  setNBodyMode('off');
+                }
+                
+                // Restore palette
+                setPalette(data.palette);
+                setSelectedSwatch(data.selectedSwatch);
+                
+                // Restore background palette
+                if (data.bgPalette) {
+                  setBgPalette(data.bgPalette);
+                }
+                if (data.selectedBgSwatch !== undefined) {
+                  setSelectedBgSwatch(data.selectedBgSwatch);
+                }
+                
+                // Initialize undo history with loaded state
+                undoManager.initialize(system.circles);
+                updateUndoRedoState();
+                
+                console.log(`Loaded project: ${data.name} (saved ${new Date(data.savedAt).toLocaleString()})`);
+              }}
+              title="Load project from JSON file"
+            >
+              Load
+            </button>
+          </div>
+  
+          <h2>Draw</h2>
+  
+          <div className="control-group">
+            <label>Circles: {circleCount}</label>
+          </div>
+  
+          <div className="control-group">
+            <label>Brush Size: {brushSize}</label>
+            <input
+              type="range"
+              min="10"
+              max="100"
+              value={brushSize}
+              onChange={(e) => setBrushSize(Number(e.target.value))}
+            />
+          </div>
+  
+          <h2>Background</h2>
+  
+          <div className="control-group">
+            <div className="swatch-row">
+              {bgPalette.map((color, i) => (
+                <div
+                  key={i}
+                  className={`swatch ${selectedBgSwatch === i ? 'selected' : ''}`}
+                  style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                  onClick={() => setSelectedBgSwatch(i)}
+                />
+              ))}
+            </div>
+          </div>
+  
+          <div className="control-group">
+            <label>Hue: {bgPalette[selectedBgSwatch].h}</label>
+            <input
+              type="range"
+              min="0"
+              max="360"
+              value={bgPalette[selectedBgSwatch].h}
+              onChange={(e) => updateBgPalette('h', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Saturation: {bgPalette[selectedBgSwatch].s}%</label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={bgPalette[selectedBgSwatch].s}
+              onChange={(e) => updateBgPalette('s', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Lightness: {bgPalette[selectedBgSwatch].l}%</label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={bgPalette[selectedBgSwatch].l}
+              onChange={(e) => updateBgPalette('l', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={resetBgPalette}
+              title="Reset background palette to defaults"
+            >
+              Reset Backgrounds
+            </button>
+          </div>
+  
+          <h2>Color</h2>
+  
+          <div className="control-group">
+            <div className="swatch-row">
+              {palette.map((color, i) => (
+                <div
+                  key={i}
+                  className={`swatch ${selectedSwatch === i ? 'selected' : ''}`}
+                  style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                  onClick={() => setSelectedSwatch(i)}
+                />
+              ))}
+            </div>
+          </div>
+  
+          <div className="control-group">
+            <label>Hue: {palette[selectedSwatch].h}</label>
+            <input
+              type="range"
+              min="0"
+              max="360"
+              value={palette[selectedSwatch].h}
+              onChange={(e) => updateSwatch('h', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Saturation: {palette[selectedSwatch].s}%</label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={palette[selectedSwatch].s}
+              onChange={(e) => updateSwatch('s', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Lightness: {palette[selectedSwatch].l}%</label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={palette[selectedSwatch].l}
+              onChange={(e) => updateSwatch('l', Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={resetCirclePalette}
+              title="Reset circle palette to defaults"
+            >
+              Reset Colors
+            </button>
+          </div>
+  
+          <div className="control-group button-row">
+            <button
+              onClick={savePalettes}
+              title="Save both palettes to file"
+            >
+              Save Palettes
+            </button>
+            <button
+              onClick={loadPalettes}
+              title="Load palettes from file"
+            >
+              Load Palettes
+            </button>
+          </div>
+  
+          <h2>Tools</h2>
+  
+          <div className="control-group button-row">
+            <button 
+              onClick={() => { 
+                saveUndoState(true);
+                clear(); 
+                clearSelection(); 
+                saveUndoState(true);
+              }}
+            >
+              Clear All
+            </button>
+            <button 
+              onClick={performUndo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+            >
+              ↶ Undo
+            </button>
+            <button 
+              onClick={performRedo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Y)"
+            >
+              ↷ Redo
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Hold to spawn circles</label>
+            <div className="button-row">
+              <button
+                onMouseDown={() => { isAutoSpawningRef.current = true; }}
+                onMouseUp={() => { isAutoSpawningRef.current = false; }}
+                onMouseLeave={() => { isAutoSpawningRef.current = false; }}
+                onTouchStart={() => { isAutoSpawningRef.current = true; }}
+                onTouchEnd={() => { isAutoSpawningRef.current = false; }}
+                className="hold-button"
+              >
+                Brush Size
+              </button>
+              <button
+                onMouseDown={() => { isRandomSpawningRef.current = true; }}
+                onMouseUp={() => { isRandomSpawningRef.current = false; }}
+                onMouseLeave={() => { isRandomSpawningRef.current = false; }}
+                onTouchStart={() => { isRandomSpawningRef.current = true; }}
+                onTouchEnd={() => { isRandomSpawningRef.current = false; }}
+                className="hold-button"
+              >
+                Random Size
+              </button>
+            </div>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => {
+                setEraseMode(!eraseMode);
+                if (!eraseMode) { setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={eraseMode ? "active danger" : ""}
+            >
+              Erase {eraseMode ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group button-row">
+            <button
+              onClick={() => {
+                setLockMode(!lockMode);
+                if (!lockMode) { setEraseMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={lockMode ? "active warning" : ""}
+            >
+              Lock {lockMode ? "ON" : "OFF"}
+            </button>
+            <button
+              onClick={unlockAll}
+              title="Unlock all circles"
+            >
+              Unlock All
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => {
+                setRecolorMode(!recolorMode);
+                if (!recolorMode) { setEraseMode(false); setLockMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); }
+              }}
+              className={recolorMode ? "active info" : ""}
+            >
+              Recolor {recolorMode ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => {
+                setSelectMode(!selectMode);
+                if (!selectMode) { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); }
+                else { clearSelection(); }
+              }}
+              className={selectMode ? "active info" : ""}
+            >
+              Select {selectMode ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          {selectedIds.size > 0 && (
+            <div className="control-group selection-actions">
+              <label>Selected: {selectedIds.size} circles</label>
+              <div className="button-row">
+                <button onClick={recolorSelection} className="info" title="Recolor selected circles">
+                  Recolor
+                </button>
+                <button onClick={deleteSelection} className="danger" title="Delete selected circles">
+                  Delete
+                </button>
+                <button onClick={invertSelection} title="Invert selection">
+                  Invert
+                </button>
+              </div>
+              <div className="button-row">
+                <button onClick={lockInverse} title="Lock all circles that are NOT selected">
+                  Lock Inverse
+                </button>
+                <button onClick={unlockAll} title="Unlock all circles">
+                  Unlock All
+                </button>
+              </div>
+            </div>
+          )}
+  
+          <h2>Magnet</h2>
+  
+          <div className="control-group button-row">
+            <button
+              onClick={() => {
+                const newMode = magnetMode === 'attract' ? 'off' : 'attract';
+                setMagnetMode(newMode);
+                if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={magnetMode === 'attract' ? "active" : ""}
+            >
+              Attract
+            </button>
+            <button
+              onClick={() => {
+                const newMode = magnetMode === 'repel' ? 'off' : 'repel';
+                setMagnetMode(newMode);
+                if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={magnetMode === 'repel' ? "active danger" : ""}
+            >
+              Repel
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Strength: {magnetStrength}</label>
+            <input
+              type="range"
+              min="1"
+              max="10"
+              value={magnetStrength}
+              onChange={(e) => setMagnetStrength(Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Radius: {magnetRadius}</label>
+            <input
+              type="range"
+              min="50"
+              max="500"
+              value={magnetRadius}
+              onChange={(e) => setMagnetRadius(Number(e.target.value))}
+            />
+          </div>
+  
+          <h2>Physics</h2>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setPhysicsPaused(!physicsPaused)}
+              className={physicsPaused ? "active warning" : ""}
+              title={physicsPaused ? "Resume physics simulation" : "Pause physics (use if app becomes unresponsive)"}
+            >
+              {physicsPaused ? "▶ Resume" : "⏸ Pause"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setGravity(!config.gravityEnabled)}
+              className={config.gravityEnabled ? "active" : ""}
+            >
+              Gravity {config.gravityEnabled ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setWalls(!config.wallsEnabled)}
+              className={config.wallsEnabled ? "active" : ""}
+            >
+              Walls {config.wallsEnabled ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setFloor(!config.floorEnabled)}
+              className={config.floorEnabled ? "active" : ""}
+            >
+              Floor {config.floorEnabled ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Collision Accuracy: {collisionIterations}</label>
+            <input
+              type="range"
+              min="1"
+              max="8"
+              step="1"
+              value={collisionIterations}
+              onChange={(e) => setCollisionIterations(Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Bounciness: {restitution.toFixed(2)}</label>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={restitution}
+              onChange={(e) => setRestitution(Number(e.target.value))}
+            />
+          </div>
+  
+          <h2>Forces</h2>
+  
+          <div className="control-group button-row">
+            <button
+              onClick={() => setNBodyMode(nBodyMode === 'clump' ? 'off' : 'clump')}
+              className={nBodyMode === 'clump' ? "active" : ""}
+            >
+              Clump
+            </button>
+            <button
+              onClick={() => setNBodyMode(nBodyMode === 'spread' ? 'off' : 'spread')}
+              className={nBodyMode === 'spread' ? "active danger" : ""}
+            >
+              Spread
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Strength: {nBodyStrength.toFixed(1)}</label>
+            <input
+              type="range"
+              min="0.5"
+              max="5"
+              step="0.1"
+              value={nBodyStrength}
+              onChange={(e) => setNBodyStrength(Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setStickyMode(!stickyMode)}
+              className={stickyMode ? "active warning" : ""}
+            >
+              Sticky {stickyMode ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Sticky Strength: {stickyStrength.toFixed(2)}</label>
+            <input
+              type="range"
+              min="0.05"
+              max="0.4"
+              step="0.01"
+              value={stickyStrength}
+              onChange={(e) => setStickyStrength(Number(e.target.value))}
+            />
+          </div>
+        </aside>
+  
+        {/* Canvas Area */}
+        <main className="canvas-container">
+          {isRecording && (
+            <div className="recording-indicator">
+              REC {(recordingDuration / 1000).toFixed(1)}s
+            </div>
+          )}
+          {isPlayingAnimation && (
+            <div className="playback-indicator">
+              ▶ Playing
+            </div>
+          )}
+          {isExportingVideo && (
+            <div className="exporting-indicator">
+              🎬 Exporting {exportResolution}x... {exportProgress?.progress || 0}%
+            </div>
+          )}
+          <canvas
+            ref={canvasRef}
+            style={{ cursor: eraseMode ? 'not-allowed' : lockMode ? 'pointer' : recolorMode ? 'cell' : selectMode ? 'crosshair' : magnetMode !== 'off' ? 'move' : flowMode === 'draw' ? 'crosshair' : flowMode === 'erase' ? 'not-allowed' : 'crosshair' }}
+            // Mouse events
+            onMouseDown={handlePointerDown}
+            onMouseMove={handlePointerMove}
+            onMouseUp={handlePointerUp}
+            onMouseLeave={handlePointerUp}
+            // Touch events
+            onTouchStart={handlePointerDown}
+            onTouchMove={handlePointerMove}
+            onTouchEnd={handlePointerUp}
+            onTouchCancel={handlePointerUp}
+          />
+        </main>
+  
+        {/* Right Panel */}
+        <aside className="panel right-panel">
+          <h2>Flow Field</h2>
+  
+          <div className="control-group button-row">
+            <button
+              onClick={() => {
+                const newMode = flowMode === 'draw' ? 'off' : 'draw';
+                setFlowMode(newMode);
+                if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={flowMode === 'draw' ? "active" : ""}
+            >
+              Draw
+            </button>
+            <button
+              onClick={() => {
+                const newMode = flowMode === 'erase' ? 'off' : 'erase';
+                setFlowMode(newMode);
+                if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
+              }}
+              className={flowMode === 'erase' ? "active danger" : ""}
+            >
+              Erase
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button
+              onClick={() => setFlowVisible(!flowVisible)}
+              className={flowVisible ? "active" : ""}
+            >
+              Visible {flowVisible ? "ON" : "OFF"}
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <button onClick={() => system.clearFlowField()}>
+              Clear All
+            </button>
+          </div>
+  
+          <div className="control-group">
+            <label>Strength: {flowStrength.toFixed(2)}</label>
+            <input
+              type="range"
+              min="0.05"
+              max="0.5"
+              step="0.01"
+              value={flowStrength}
+              onChange={(e) => setFlowStrength(Number(e.target.value))}
+            />
+          </div>
+  
+          <div className="control-group">
+            <label>Radius: {flowRadius}</label>
+            <input
+              type="range"
+              min="50"
+              max="300"
+              value={flowRadius}
+              onChange={(e) => setFlowRadius(Number(e.target.value))}
+            />
+          </div>
+  
+          <h2>Scale All</h2>
+          
+          <div className="control-group">
+            <label>Hold & drag to scale</label>
+            <div className="spring-slider">
+              <span className="slider-label">−</span>
+              <input
+                type="range"
+                min="-100"
+                max="100"
+                value={scaleSliderValue}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setScaleSliderValue(val);
+                  scaleSliderRef.current = val / 100;
+                }}
+                onMouseDown={() => { isScalingRef.current = true; }}
+                onMouseUp={() => {
+                  isScalingRef.current = false;
+                  scaleSliderRef.current = 0;
+                  setScaleSliderValue(0);
+                }}
+                onMouseLeave={() => {
+                  if (isScalingRef.current) {
+                    isScalingRef.current = false;
+                    scaleSliderRef.current = 0;
+                    setScaleSliderValue(0);
+                  }
+                }}
+                onTouchStart={() => { isScalingRef.current = true; }}
+                onTouchEnd={() => {
+                  isScalingRef.current = false;
+                  scaleSliderRef.current = 0;
+                  setScaleSliderValue(0);
+                }}
+              />
+              <span className="slider-label">+</span>
+            </div>
+          </div>
+  
+          <h2>Random Scale</h2>
+          
+          <div className="control-group">
+            <label>Hold & drag to randomize</label>
+            <div className="spring-slider">
+              <span className="slider-label">−</span>
+              <input
+                type="range"
+                min="-100"
+                max="100"
+                value={randomScaleSliderValue}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setRandomScaleSliderValue(val);
+                  randomScaleSliderRef.current = val / 100;
+                }}
+                onMouseDown={() => { isRandomScalingRef.current = true; }}
+                onMouseUp={() => {
+                  isRandomScalingRef.current = false;
+                  randomScaleSliderRef.current = 0;
+                  setRandomScaleSliderValue(0);
+                }}
+                onMouseLeave={() => {
+                  if (isRandomScalingRef.current) {
+                    isRandomScalingRef.current = false;
+                    randomScaleSliderRef.current = 0;
+                    setRandomScaleSliderValue(0);
+                  }
+                }}
+                onTouchStart={() => { isRandomScalingRef.current = true; }}
+                onTouchEnd={() => {
+                  isRandomScalingRef.current = false;
+                  randomScaleSliderRef.current = 0;
+                  setRandomScaleSliderValue(0);
+                }}
+              />
+              <span className="slider-label">+</span>
+            </div>
+          </div>
+  
+          <h2>Layers</h2>
+          
+          <div className="control-group button-row">
+            <button onClick={() => addCircleLayer()}>+ Circles</button>
+            <button onClick={() => addPaintLayer()}>+ Paint</button>
+          </div>
+          
+          <div className="layer-list">
+            {[...layers].reverse().map((layer) => (
+              <div 
+                key={layer.id}
+                className={`layer-item ${layer.id === activeLayerId ? 'active' : ''}`}
+                onClick={() => setActiveLayerId(layer.id)}
+              >
+                <div className="layer-info">
+                  <span className="layer-type">{layer.type === 'circles' ? '●' : '◐'}</span>
+

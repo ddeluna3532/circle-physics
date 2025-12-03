@@ -17,3 +17,39 @@ Thumbs.db
 
 # Logs
 *.log
+.vs/
+
+# --- ADD THESE FOR OPENFRAMEWORKS ---
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Executables and build folders
+*.exe
+*.out
+*.app
+bin/
+obj/
+
+# Visual Studio / MSBuild
+*.pdb
+*.idb
+*.ilk
+*.suo
+*.tlog
+*.user
+*.ipch
+.vs/
+
+target/

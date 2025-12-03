@@ -1,2 +1,3 @@
-export * from "./usePhysics";
-export * from "./useLayers";
+export { usePhysics } from './usePhysics';
+export { useLayers } from './useLayers';
+export { usePalette } from './usePalette';

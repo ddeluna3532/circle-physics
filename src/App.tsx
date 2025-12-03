@@ -4,11 +4,24 @@ import { Circle } from "./physics";
 import { PaintLayer } from "./layers";
 import { interpolateStroke } from "./layers/WatercolorBrush";
 import { exportSVG } from "./layers/SVGExporter";
-import { saveProject, loadProject, restoreCircles } from "./layers/ProjectManager";
+import { saveProject, loadProject, restoreCircles, ProjectData } from "./layers/ProjectManager";
 import { UndoManager, applySnapshot } from "./layers/UndoManager";
-import { AnimationRecorder, AnimationData, CircleSnapshot, saveAnimation, loadAnimationFile } from "./layers/AnimationRecorder";
+import { AnimationRecorder, AnimationData, CircleSnapshot, Keyframe, saveAnimation, loadAnimationFile } from "./layers/AnimationRecorder";
 import { exportVideoHighQuality, downloadVideo, isVideoExportSupported, VideoExportProgress } from "./layers/VideoExporter";
 import "./styles.css";
+
+// Tauri API types (only available in desktop app)
+declare global {
+  interface Window {
+    __TAURI__?: {
+      window: {
+        getCurrent(): {
+          close(): Promise<void>;
+        };
+      };
+    };
+  }
+}
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -32,6 +45,7 @@ function App() {
   // Layer system
   const {
     layers,
+    setLayers,
     activeLayerId,
     setActiveLayerId,
     getActiveLayer,
@@ -48,6 +62,10 @@ function App() {
     restoreLayers,
     brush,
   } = useLayers();
+
+  // Tab state
+  const [leftTab, setLeftTab] = useState<'project' | 'colors' | 'tools' | 'physics'>('project');
+  const [rightTab, setRightTab] = useState<'layers' | 'effects'>('layers');
 
   // UI state
   const [brushSize, setBrushSize] = useState(30);
@@ -75,6 +93,15 @@ function App() {
   const [nBodyStrength, setNBodyStrength] = useState(1.5);
   const [stickyMode, setStickyMode] = useState(false);
   const [stickyStrength, setStickyStrength] = useState(0.15);
+  
+  // Turbulence mode state
+  const [turbulenceMode, setTurbulenceMode] = useState(false);
+  const [turbulenceStrength, setTurbulenceStrength] = useState(2);
+  const [turbulenceScale, setTurbulenceScale] = useState(100); // Noise table size
+  const [turbulenceFrequency, setTurbulenceFrequency] = useState(0.5); // Speed of animated noise
+  
+  // Turbulence animation time
+  const turbulenceTimeRef = useRef(0);
   
   // Collision settings
   const [collisionIterations, setCollisionIterations] = useState(3);
@@ -108,12 +135,19 @@ function App() {
   const [exportCameraPanY, setExportCameraPanY] = useState(0);
   const [showCameraPreview, setShowCameraPreview] = useState(false);
   
+  // Motion blur state
+  const [motionBlurEnabled, setMotionBlurEnabled] = useState(false);
+  const [motionBlurSamples, setMotionBlurSamples] = useState(8);
+  const [shutterAngle, setShutterAngle] = useState(180);
+  
   // Scale all slider state
   const scaleSliderRef = useRef(0); // -1 to 1, 0 is center
+  const [scaleSliderValue, setScaleSliderValue] = useState(0);
   const isScalingRef = useRef(false);
   
   // Random scale slider state
   const randomScaleSliderRef = useRef(0);
+  const [randomScaleSliderValue, setRandomScaleSliderValue] = useState(0);
   const isRandomScalingRef = useRef(false);
   
   // Auto-spawn state
@@ -148,9 +182,6 @@ function App() {
   // Background palette state
   const [bgPalette, setBgPalette] = useState(DEFAULT_BG_PALETTE);
   const [selectedBgSwatch, setSelectedBgSwatch] = useState(2); // Default to warm cream
-  
-  // Which color type is being edited (for shared HSL sliders)
-  const [colorEditMode, setColorEditMode] = useState<'circle' | 'background'>('circle');
   
   // Get current background color as HSL string
   const getBackgroundColor = useCallback(() => {
@@ -252,6 +283,7 @@ function App() {
   }, []);
   
   // Drag state
+  const [dragging, setDragging] = useState<Circle | null>(null);
   const draggingRef = useRef<Circle | null>(null);
   const isPaintingRef = useRef(false);
   const isErasingRef = useRef(false);
@@ -309,28 +341,37 @@ function App() {
       return newPalette;
     });
   };
-  
-  // Update color based on current edit mode (for shared sliders)
-  const updateActiveColor = useCallback((key: 'h' | 's' | 'l', value: number) => {
-    if (colorEditMode === 'circle') {
-      setPalette(prev => {
-        const newPalette = [...prev];
-        newPalette[selectedSwatch] = { ...newPalette[selectedSwatch], [key]: value };
-        return newPalette;
-      });
-    } else {
-      setBgPalette(prev => {
-        const newPalette = [...prev];
-        newPalette[selectedBgSwatch] = { ...newPalette[selectedBgSwatch], [key]: value };
-        return newPalette;
-      });
-    }
-  }, [colorEditMode, selectedSwatch, selectedBgSwatch]);
-  
-  // Get the currently active color (for shared sliders)
-  const activeColor = colorEditMode === 'circle' 
-    ? palette[selectedSwatch] 
-    : bgPalette[selectedBgSwatch];
+
+  // Clear selection
+  const clearSelection = useCallback(() => {
+    setSelectedIds(new Set());
+  }, []);
+
+  // Reset all simulation parameters to defaults
+  const resetSimulationDefaults = useCallback(() => {
+    setGravity(true);
+    setFloor(true);
+    setWalls(false);
+    setCollisionIterations(3);
+    setRestitution(0.6);
+    
+    setNBodyMode('off');
+    setStickyMode(false);
+    setTurbulenceMode(false);
+    
+    setBrushSize(30);
+    setMagnetMode('off');
+    setFlowMode('off');
+    
+    resetCirclePalette();
+    resetBgPalette();
+    
+    setAspectRatio("4:3");
+    
+    // Clear selection and circles
+    clear();
+    clearSelection();
+  }, [clear, clearSelection, resetCirclePalette, resetBgPalette]);
 
   // Render loop
   const render = useCallback(() => {
@@ -616,11 +657,6 @@ function App() {
     }
   }, [circles, selectedIds, isCircleModifiable, getRandomPaletteColor]);
 
-  // Clear selection
-  const clearSelection = useCallback(() => {
-    setSelectedIds(new Set());
-  }, []);
-
   // Invert selection - select unselected, deselect selected
   const invertSelection = useCallback(() => {
     const visibleCircleIds = circles
@@ -638,18 +674,6 @@ function App() {
     }
     setSelectedIds(newSelection);
   }, [circles, layers, selectedIds]);
-
-  // Select all visible circles
-  const selectAll = useCallback(() => {
-    const visibleCircleIds = circles
-      .filter(c => {
-        const layer = layers.find(l => l.id === c.layerId);
-        return layer?.visible;
-      })
-      .map(c => c.id);
-    
-    setSelectedIds(new Set(visibleCircleIds));
-  }, [circles, layers]);
 
   // Lock inverse - lock all circles that are NOT selected
   const lockInverse = useCallback(() => {
@@ -781,7 +805,7 @@ function App() {
         const bAffected = isCircleAffected(b);
         
         // Skip if both unaffected
-        if (!aAffected && !bAffected) continue;
+        if (!aAffected && !bAffected) return;
         
         const dx = b.x - a.x;
         const dy = b.y - a.y;
@@ -871,6 +895,35 @@ function App() {
       }
     }
   }, [circles, stickyMode, stickyStrength, isCircleAffected]);
+
+  // Apply turbulence - randomize positions (smaller circles affected more) with animated noise
+  const applyTurbulence = useCallback(() => {
+    if (!turbulenceMode || turbulenceStrength === 0) return;
+    
+    // Increment time for animation
+    turbulenceTimeRef.current += turbulenceFrequency * 0.01;
+    const time = turbulenceTimeRef.current;
+    
+    for (const c of circles) {
+      if (!isCircleAffected(c)) continue;
+      
+      // Use circle position and time to create animated noise
+      // This creates smooth, flowing turbulence instead of random jitter
+      const noiseX = (c.x / turbulenceScale) + time;
+      const noiseY = (c.y / turbulenceScale) + time * 0.7; // Different time offset for Y
+      
+      // Simple pseudo-noise function (sine-based for smooth animation)
+      const angleX = Math.sin(noiseX) * Math.cos(noiseY * 1.3) * Math.PI * 2;
+      const angleY = Math.cos(noiseX * 1.7) * Math.sin(noiseY) * Math.PI * 2;
+      
+      // Smaller circles are affected more (inversely proportional to radius)
+      const responsiveness = 30 / c.r; // Smaller radius = higher value
+      const force = turbulenceStrength * responsiveness * 0.05;
+      
+      c.vx += Math.cos(angleX) * force;
+      c.vy += Math.sin(angleY) * force;
+    }
+  }, [circles, turbulenceMode, turbulenceStrength, turbulenceScale, turbulenceFrequency, isCircleAffected]);
 
   // Apply continuous scaling to all circles (or just selected if in select mode)
   const applyScaling = useCallback(() => {
@@ -1032,6 +1085,18 @@ function App() {
     setIsPlayingAnimation(false);
     setPlaybackCircles(null);
   }, [animationRecorder]);
+
+
+  // Exit application
+  const exitApplication = useCallback(() => {
+    if (window.__TAURI__) {
+      window.__TAURI__.window.getCurrent().close();
+    } else {
+      if (window.confirm('Close the application?')) {
+        window.close();
+      }
+    }
+  }, []);
 
   const saveCurrentAnimation = useCallback(() => {
     if (!animationRecorder.hasAnimation()) {
@@ -1245,7 +1310,7 @@ function App() {
         exportCanvas,
         renderFrameForExport,
         duration,
-        { fps: exportFps, quality: 0.9 },
+        { fps: exportFps, quality: 0.9, format: 'png', motionBlur: motionBlurEnabled, motionBlurSamples: motionBlurSamples, shutterAngle: shutterAngle },
         setExportProgress
       );
       
@@ -1265,7 +1330,7 @@ function App() {
     
     // Re-render current state
     render();
-  }, [animationRecorder, bgPalette, selectedBgSwatch, layers, render, exportResolution, exportCameraZoom, exportCameraPanX, exportCameraPanY]);
+  }, [animationRecorder, bgPalette, selectedBgSwatch, layers, render, exportResolution, exportCameraZoom, exportCameraPanX, exportCameraPanY, motionBlurEnabled, motionBlurSamples, shutterAngle]);
 
   // Animation loop
   useEffect(() => {
@@ -1293,6 +1358,7 @@ function App() {
         applyMagnet();
         applyNBodyForce();
         applyStickyForce();
+        applyTurbulence();
         applyScaling();
         applyRandomScaling();
         autoSpawn();
@@ -1313,7 +1379,7 @@ function App() {
 
     animationRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animationRef.current);
-  }, [system, render, applyMagnet, applyNBodyForce, applyStickyForce, applyScaling, applyRandomScaling, autoSpawn, autoSpawnRandom, physicsPaused, isRecording, isPlayingAnimation, animationRecorder]);
+  }, [system, render, applyMagnet, applyNBodyForce, applyStickyForce, applyTurbulence, applyScaling, applyRandomScaling, autoSpawn, autoSpawnRandom, physicsPaused, isRecording, isPlayingAnimation, animationRecorder]);
 
   // Handle canvas resize
   useEffect(() => {
@@ -1399,21 +1465,11 @@ function App() {
           clearSelection();
         } else if (selectMode) {
           setSelectMode(false);
-        } else if (eraseMode) {
-          setEraseMode(false);
-        } else if (lockMode) {
-          setLockMode(false);
-        } else if (recolorMode) {
-          setRecolorMode(false);
-        } else if (magnetMode !== 'off') {
-          setMagnetMode('off');
-        } else if (flowMode !== 'off') {
-          setFlowMode('off');
-        } else if (paintMode) {
-          setPaintMode(false);
         } else {
-          // Close app if no modes are active
-          window.close();
+          // Close app (only works in Tauri desktop app)
+          if (window.__TAURI__) {
+            window.__TAURI__.window.getCurrent().close();
+          }
         }
       }
       // P or Space - toggle physics pause (not during animation)
@@ -1487,10 +1543,9 @@ function App() {
         // Stop dragging, switch to scaling
         draggingRef.current.isDragging = false;
         draggingRef.current = null;
+        setDragging(null);
         isPaintingRef.current = false;
-        if (pinchRef.current.circle) {
-          console.log("pinch started on circle, initial radius:", pinchRef.current.circle.r);
-        }
+        console.log("pinch started on circle, initial radius:", pinchRef.current.circle?.r);
         return;
       }
       
@@ -1632,6 +1687,7 @@ function App() {
       if (hit && isCircleModifiable(hit)) {
         hit.isDragging = true;
         draggingRef.current = hit;
+        setDragging(hit);
         console.log("started dragging circle");
       } else if (!hit) {
         // Start painting mode and add first circle
@@ -1889,6 +1945,7 @@ function App() {
       console.log("releasing with velocity:", draggingRef.current.vx, draggingRef.current.vy);
       draggingRef.current.isDragging = false;
       draggingRef.current = null;
+      setDragging(null);
       madeChanges = true;
     }
     
@@ -1903,20 +1960,18 @@ function App() {
     }
   };
 
-  // Tab state for left and right panels
-  const [leftTab, setLeftTab] = useState<'canvas' | 'colors' | 'tools'>('canvas');
-  const [rightTab, setRightTab] = useState<'physics' | 'layers'>('physics');
-
   return (
     <div className="app">
-      {/* Left Panel with Tabs */}
+      {/* Left Panel */}
       <aside className="panel left-panel">
+        
+        {/* Tab Navigation */}
         <div className="tab-nav">
           <button 
-            className={`tab-button ${leftTab === 'canvas' ? 'active' : ''}`}
-            onClick={() => setLeftTab('canvas')}
+            className={`tab-button ${leftTab === 'project' ? 'active' : ''}`}
+            onClick={() => setLeftTab('project')}
           >
-            Canvas
+            Project
           </button>
           <button 
             className={`tab-button ${leftTab === 'colors' ? 'active' : ''}`}
@@ -1930,610 +1985,958 @@ function App() {
           >
             Tools
           </button>
+          <button 
+            className={`tab-button ${leftTab === 'physics' ? 'active' : ''}`}
+            onClick={() => setLeftTab('physics')}
+          >
+            Physics
+          </button>
         </div>
 
+        {/* Tab Content */}
         <div className="tab-content">
-          {/* Canvas & Export Tab */}
-          <div className={`tab-pane ${leftTab === 'canvas' ? 'active' : ''}`}>
-            <div className="section-header">Canvas Settings</div>
+          {/* PROJECT TAB */}
+          <div className={`tab-pane ${leftTab === 'project' ? 'active' : ''}`}>
+            <h2>Canvas</h2>
+
+        <div className="control-group">
+          <label>Aspect Ratio</label>
+          <input
+            type="text"
+            value={aspectRatio}
+            onChange={(e) => setAspectRatio(e.target.value)}
+            placeholder="4:3"
+            className="aspect-input"
+          />
+        </div>
+
+        <h2>Export</h2>
+
+        <div className="control-group button-row">
+          <button 
+            onClick={() => {
+              const canvas = canvasRef.current;
+              if (!canvas) return;
+              const link = document.createElement('a');
+              link.download = `circles-${Date.now()}.png`;
+              link.href = canvas.toDataURL('image/png');
+              link.click();
+            }}
+            title="Export canvas as PNG image"
+          >
+            PNG
+          </button>
+          <button 
+            onClick={() => {
+              const canvas = canvasRef.current;
+              if (!canvas) return;
+              exportSVG(system.circles, canvas.width, canvas.height, layers, {
+                backgroundColor: getBackgroundHex(),
+                stencilMargin: 10,
+                includeStencilLayers: true,
+              });
+            }}
+            title="Export as multi-layered SVG (includes stencil layers for cutting)"
+          >
+            SVG
+          </button>
+        </div>
+
+        <h2>Animation</h2>
+
+        <div className="control-group">
+          {!isRecording && !isPlayingAnimation && (
+            <button
+              onClick={startRecording}
+              className="danger"
+              title="Start recording animation (R)"
+            >
+              ⏺ Record
+            </button>
+          )}
+          {isRecording && (
+            <button
+              onClick={stopRecording}
+              className="active danger"
+              title="Stop recording (R or Escape)"
+            >
+              ⏹ Stop ({(recordingDuration / 1000).toFixed(1)}s, {recordingFrames} frames)
+            </button>
+          )}
+        </div>
+
+        {hasAnimation && !isRecording && (
+          <div className="control-group">
+            {!isPlayingAnimation ? (
+              <button
+                onClick={playAnimation}
+                className="active"
+                title="Play recorded animation"
+              >
+                ▶ Play ({(animationDuration / 1000).toFixed(1)}s)
+              </button>
+            ) : (
+              <button
+                onClick={stopAnimation}
+                className="active warning"
+                title="Stop playback (Escape)"
+              >
+                ⏹ Stop Playback
+              </button>
+            )}
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <label>Smoothing: {(smoothingStrength * 100).toFixed(0)}%</label>
+            <input
+              type="range"
+              min="0"
+              max="0.8"
+              step="0.05"
+              value={smoothingStrength}
+              onChange={(e) => setSmoothingStrength(Number(e.target.value))}
+            />
+            <button
+              onClick={applyAnimationSmoothing}
+              title="Apply smoothing to recorded animation (makes movements more organic)"
+            >
+              Apply Smoothing
+            </button>
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <label>Export Resolution:</label>
+            <div className="resolution-selector">
+              {[1, 2, 4].map(res => (
+                <button
+                  key={res}
+                  onClick={() => setExportResolution(res)}
+                  className={exportResolution === res ? 'active' : ''}
+                  disabled={isExportingVideo}
+                  title={`${res}x resolution (${canvasRef.current ? canvasRef.current.width * res : '?'}x${canvasRef.current ? canvasRef.current.height * res : '?'})`}
+                >
+                  {res}x
+                </button>
+              ))}
+            </div>
+            <span className="resolution-info">
+              {canvasRef.current ? `${canvasRef.current.width * exportResolution}×${canvasRef.current.height * exportResolution}` : ''}
+            </span>
+          </div>
+        )}
+
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group camera-controls">
+            <div className="camera-header">
+              <label>Camera:</label>
+              <button
+                onClick={() => setShowCameraPreview(!showCameraPreview)}
+                className={showCameraPreview ? 'active small' : 'small'}
+                title="Toggle camera preview overlay"
+              >
+                {showCameraPreview ? '👁 Hide' : '👁 Preview'}
+              </button>
+            </div>
+            
+            <label>Zoom: {exportCameraZoom.toFixed(1)}x</label>
+            <input
+              type="range"
+              min="0.5"
+              max="4"
+              step="0.1"
+              value={exportCameraZoom}
+              onChange={(e) => setExportCameraZoom(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <label>Pan X: {exportCameraPanX.toFixed(0)}%</label>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              step="1"
+              value={exportCameraPanX}
+              onChange={(e) => setExportCameraPanX(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <label>Pan Y: {exportCameraPanY.toFixed(0)}%</label>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              step="1"
+              value={exportCameraPanY}
+              onChange={(e) => setExportCameraPanY(Number(e.target.value))}
+              disabled={isExportingVideo}
+            />
+            
+            <button
+              onClick={() => {
+                setExportCameraZoom(1);
+                setExportCameraPanX(0);
+                setExportCameraPanY(0);
+              }}
+              disabled={isExportingVideo || (exportCameraZoom === 1 && exportCameraPanX === 0 && exportCameraPanY === 0)}
+              title="Reset camera to default"
+            >
+              Reset Camera
+            </button>
+          </div>
+        )}
+
+
+        {/* Motion Blur Controls */}
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <>
+            <h3>Motion Blur</h3>
             
             <div className="control-group">
-              <label>Aspect Ratio</label>
-              <input
-                type="text"
-                value={aspectRatio}
-                onChange={(e) => setAspectRatio(e.target.value)}
-                placeholder="4:3"
-                className="aspect-input"
-              />
-            </div>
-
-            <div className="section-header">Export</div>
-            
-            <div className="control-group button-row">
-              <button 
-                onClick={() => {
-                  const canvas = canvasRef.current;
-                  if (!canvas) return;
-                  const link = document.createElement('a');
-                  link.download = `circles-${Date.now()}.png`;
-                  link.href = canvas.toDataURL('image/png');
-                  link.click();
-                }}
-                title="Export canvas as PNG image"
+              <button
+                onClick={() => setMotionBlurEnabled(!motionBlurEnabled)}
+                className={motionBlurEnabled ? "active" : ""}
               >
-                PNG
-              </button>
-              <button 
-                onClick={() => {
-                  const canvas = canvasRef.current;
-                  if (!canvas) return;
-                  exportSVG(system.circles, canvas.width, canvas.height, layers, {
-                    backgroundColor: getBackgroundHex(),
-                    stencilMargin: 10,
-                    includeStencilLayers: true,
-                  });
-                }}
-                title="Export as multi-layered SVG"
-              >
-                SVG
+                Motion Blur {motionBlurEnabled ? "ON" : "OFF"}
               </button>
             </div>
 
-            <div className="section-header">Animation</div>
-            
-            <div className="control-group">
-              {!isRecording && !isPlayingAnimation && (
-                <button
-                  onClick={startRecording}
-                  className="danger"
-                  title="Start recording animation (R)"
-                >
-                  ⏺ Record
-                </button>
-              )}
-              {isRecording && (
-                <button
-                  onClick={stopRecording}
-                  className="active danger"
-                  title="Stop recording (R or Escape)"
-                >
-                  ⏹ Stop ({(recordingDuration / 1000).toFixed(1)}s, {recordingFrames} frames)
-                </button>
-              )}
-            </div>
-
-            {hasAnimation && !isRecording && (
+            {motionBlurEnabled && (
               <>
                 <div className="control-group">
-                  {!isPlayingAnimation ? (
-                    <button
-                      onClick={playAnimation}
-                      className="active"
-                      title="Play recorded animation"
-                    >
-                      ▶ Play ({(animationDuration / 1000).toFixed(1)}s)
-                    </button>
-                  ) : (
-                    <button
-                      onClick={stopAnimation}
-                      className="active warning"
-                      title="Stop playback (Escape)"
-                    >
-                      ⏹ Stop Playback
-                    </button>
-                  )}
+                  <label>Samples: {motionBlurSamples}</label>
+                  <input
+                    type="range"
+                    min="2"
+                    max="32"
+                    value={motionBlurSamples}
+                    onChange={(e) => setMotionBlurSamples(Number(e.target.value))}
+                  />
+                  <div style={{ fontSize: '12px', color: '#888', marginTop: '4px' }}>
+                    More samples = smoother blur (2-32)
+                  </div>
                 </div>
 
-                {!isPlayingAnimation && (
-                  <>
-                    <div className="control-group">
-                      <label>Smoothing: {(smoothingStrength * 100).toFixed(0)}%</label>
-                      <input
-                        type="range"
-                        min="0"
-                        max="0.8"
-                        step="0.05"
-                        value={smoothingStrength}
-                        onChange={(e) => setSmoothingStrength(Number(e.target.value))}
-                      />
-                      <button
-                        onClick={applyAnimationSmoothing}
-                        title="Apply smoothing to animation"
-                      >
-                        Apply Smoothing
-                      </button>
-                    </div>
+                <div className="control-group">
+                  <label>Shutter Angle: {shutterAngle}°</label>
+                  <input
+                    type="range"
+                    min="45"
+                    max="360"
+                    step="45"
+                    value={shutterAngle}
+                    onChange={(e) => setShutterAngle(Number(e.target.value))}
+                  />
+                  <div style={{ fontSize: '12px', color: '#888', marginTop: '4px' }}>
+                    180° = cinematic, 360° = maximum blur
+                  </div>
+                </div>
 
-                    <div className="control-group">
-                      <label>Export Resolution:</label>
-                      <div className="resolution-selector">
-                        {[1, 2, 4].map(res => (
-                          <button
-                            key={res}
-                            onClick={() => setExportResolution(res)}
-                            className={exportResolution === res ? 'active' : ''}
-                            disabled={isExportingVideo}
-                          >
-                            {res}x
-                          </button>
-                        ))}
-                      </div>
-                      <span className="resolution-info">
-                        {canvasRef.current ? `${canvasRef.current.width * exportResolution}×${canvasRef.current.height * exportResolution}` : ''}
-                      </span>
-                    </div>
-
-                    <div className="control-group camera-controls">
-                      <div className="camera-header">
-                        <label>Camera:</label>
-                        <button
-                          onClick={() => setShowCameraPreview(!showCameraPreview)}
-                          className={showCameraPreview ? 'active small' : 'small'}
-                        >
-                          {showCameraPreview ? '👁 Hide' : '👁 Preview'}
-                        </button>
-                      </div>
-                      
-                      <label>Zoom: {exportCameraZoom.toFixed(1)}x</label>
-                      <input
-                        type="range"
-                        min="0.5"
-                        max="4"
-                        step="0.1"
-                        value={exportCameraZoom}
-                        onChange={(e) => setExportCameraZoom(Number(e.target.value))}
-                        disabled={isExportingVideo}
-                      />
-                      
-                      <label>Pan X: {exportCameraPanX.toFixed(0)}%</label>
-                      <input
-                        type="range"
-                        min="-100"
-                        max="100"
-                        step="1"
-                        value={exportCameraPanX}
-                        onChange={(e) => setExportCameraPanX(Number(e.target.value))}
-                        disabled={isExportingVideo}
-                      />
-                      
-                      <label>Pan Y: {exportCameraPanY.toFixed(0)}%</label>
-                      <input
-                        type="range"
-                        min="-100"
-                        max="100"
-                        step="1"
-                        value={exportCameraPanY}
-                        onChange={(e) => setExportCameraPanY(Number(e.target.value))}
-                        disabled={isExportingVideo}
-                      />
-                      
-                      <button
-                        onClick={() => {
-                          setExportCameraZoom(1);
-                          setExportCameraPanX(0);
-                          setExportCameraPanY(0);
-                        }}
-                        disabled={isExportingVideo || (exportCameraZoom === 1 && exportCameraPanX === 0 && exportCameraPanY === 0)}
-                      >
-                        Reset Camera
-                      </button>
-                    </div>
-
-                    <div className="control-group">
-                      <button
-                        onClick={exportAnimationVideo}
-                        disabled={isExportingVideo}
-                        className="active"
-                      >
-                        {isExportingVideo ? 'Exporting...' : '🎬 Export PNG Sequence'}
-                      </button>
-                      {exportProgress && isExportingVideo && (
-                        <div className="export-progress">
-                          <div 
-                            className="export-progress-bar"
-                            style={{ width: `${exportProgress.progress}%` }}
-                          />
-                          <span className="export-progress-text">
-                            {exportProgress.message}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-
-                <div className="control-group button-row">
-                  <button
-                    onClick={saveCurrentAnimation}
-                    disabled={isRecording}
-                    title="Save animation to file"
-                  >
-                    Save
-                  </button>
-                  <button
-                    onClick={loadAnimation}
-                    disabled={isRecording || isPlayingAnimation}
-                    title="Load animation from file"
-                  >
-                    Load
-                  </button>
-                  <button
-                    onClick={clearAnimation}
-                    disabled={isRecording || isPlayingAnimation}
-                    className="danger"
-                    title="Clear animation"
-                  >
-                    Clear
-                  </button>
+                <div style={{
+                  padding: '10px',
+                  background: 'rgba(74, 158, 255, 0.1)',
+                  border: '1px solid rgba(74, 158, 255, 0.3)',
+                  borderRadius: '4px',
+                  fontSize: '13px',
+                  marginBottom: '10px'
+                }}>
+                  <strong>Render time:</strong> ~{(motionBlurSamples * 0.1).toFixed(1)}s per frame
+                  <br />
+                  ({motionBlurSamples}x slower than no blur)
                 </div>
               </>
             )}
-
-            {!hasAnimation && !isRecording && (
-              <div className="control-group">
-                <button onClick={loadAnimation}>Load Animation</button>
+          </>
+        )}
+        {hasAnimation && !isRecording && !isPlayingAnimation && (
+          <div className="control-group">
+            <button
+              onClick={exportAnimationVideo}
+              disabled={isExportingVideo}
+              className="active"
+              title="Export animation as PNG sequence (ZIP) for After Effects"
+            >
+              {isExportingVideo ? 'Exporting...' : '🎬 Export PNG Sequence'}
+            </button>
+            {exportProgress && isExportingVideo && (
+              <div className="export-progress">
+                <div 
+                  className="export-progress-bar"
+                  style={{ width: `${exportProgress.progress}%` }}
+                />
+                <span className="export-progress-text">
+                  {exportProgress.message}
+                </span>
               </div>
             )}
+          </div>
+        )}
 
-            <div className="section-header">Project</div>
-            
-            <div className="control-group button-row">
-              <button 
-                onClick={() => {
-                  const projectName = prompt('Project name:', 'circles-project') || 'circles-project';
-                  saveProject(
-                    system.circles,
-                    layers,
-                    activeLayerId,
-                    aspectRatio,
-                    {
-                      gravityEnabled: system.config.gravityEnabled,
-                      gravityStrength: system.config.gravityStrength,
-                      floorEnabled: system.config.floorEnabled,
-                      floorY: system.config.floorY,
-                      wallsEnabled: system.config.wallsEnabled,
-                      damping: system.config.damping,
-                      collisionIterations,
-                      restitution,
-                    },
-                    {
-                      brushSize,
-                      stickyEnabled: stickyMode,
-                      stickyStrength,
-                      clumpEnabled: nBodyMode === 'clump',
-                      spreadEnabled: nBodyMode === 'spread',
-                    },
-                    palette,
-                    selectedSwatch,
-                    bgPalette,
-                    selectedBgSwatch,
-                    projectName
-                  );
-                }}
-                title="Save project"
-              >
-                Save
-              </button>
-              <button 
-                onClick={async () => {
-                  const data = await loadProject();
-                  if (!data) return;
-                  
-                  system.circles = restoreCircles(data);
-                  restoreLayers(data.layers, data.activeLayerId);
-                  setAspectRatio(data.aspectRatio);
-                  
-                  system.config.gravityEnabled = data.physics.gravityEnabled;
-                  system.config.gravityStrength = data.physics.gravityStrength;
-                  system.config.floorEnabled = data.physics.floorEnabled;
-                  system.config.floorY = data.physics.floorY;
-                  system.config.wallsEnabled = data.physics.wallsEnabled;
-                  system.config.damping = data.physics.damping;
-                  setGravity(data.physics.gravityEnabled);
-                  setFloor(data.physics.floorEnabled);
-                  
-                  if (data.physics.collisionIterations !== undefined) {
-                    setCollisionIterations(data.physics.collisionIterations);
-                  }
-                  if (data.physics.restitution !== undefined) {
-                    setRestitution(data.physics.restitution);
-                  }
-                  
-                  setBrushSize(data.settings.brushSize);
-                  setStickyMode(data.settings.stickyEnabled);
-                  setStickyStrength(data.settings.stickyStrength);
-                  if (data.settings.clumpEnabled) {
-                    setNBodyMode('clump');
-                  } else if (data.settings.spreadEnabled) {
-                    setNBodyMode('spread');
-                  } else {
-                    setNBodyMode('off');
-                  }
-                  
-                  setPalette(data.palette);
-                  setSelectedSwatch(data.selectedSwatch);
-                  
-                  if (data.bgPalette) {
-                    setBgPalette(data.bgPalette);
-                  }
-                  if (data.selectedBgSwatch !== undefined) {
-                    setSelectedBgSwatch(data.selectedBgSwatch);
-                  }
-                  
-                  undoManager.initialize(system.circles);
-                  updateUndoRedoState();
-                  
-                  console.log(`Loaded project: ${data.name}`);
-                }}
-                title="Load project"
-              >
-                Load
-              </button>
-            </div>
+        {(hasAnimation || isRecording) && (
+          <div className="control-group button-row">
+            <button
+              onClick={saveCurrentAnimation}
+              disabled={isRecording}
+              title="Save animation to file"
+            >
+              Save
+            </button>
+            <button
+              onClick={loadAnimation}
+              disabled={isRecording || isPlayingAnimation}
+              title="Load animation from file"
+            >
+              Load
+            </button>
+            <button
+              onClick={clearAnimation}
+              disabled={isRecording || isPlayingAnimation}
+              className="danger"
+              title="Clear recorded animation"
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
+        {!hasAnimation && !isRecording && (
+          <div className="control-group">
+            <button
+              onClick={loadAnimation}
+              title="Load animation from file"
+            >
+              Load Animation
+            </button>
+          </div>
+        )}
+
+        <h2>Project</h2>
+
+        <div className="control-group button-row">
+          <button 
+            onClick={() => {
+              const projectName = prompt('Project name:', 'circles-project') || 'circles-project';
+              saveProject(
+                system.circles,
+                layers,
+                activeLayerId,
+                aspectRatio,
+                {
+                  gravityEnabled: system.config.gravityEnabled,
+                  gravityStrength: system.config.gravityStrength,
+                  floorEnabled: system.config.floorEnabled,
+                  floorY: system.config.floorY,
+                  wallsEnabled: system.config.wallsEnabled,
+                  damping: system.config.damping,
+                  collisionIterations,
+                  restitution,
+                },
+                {
+                  brushSize,
+                  stickyEnabled: stickyMode,
+                  stickyStrength,
+                  clumpEnabled: nBodyMode === 'clump',
+                  spreadEnabled: nBodyMode === 'spread',
+                },
+                palette,
+                selectedSwatch,
+                bgPalette,
+                selectedBgSwatch,
+                projectName
+              );
+            }}
+            title="Save project to JSON file"
+          >
+            Save
+          </button>
+          <button 
+            onClick={async () => {
+              const data = await loadProject();
+              if (!data) return;
+              
+              // Restore circles
+              system.circles = restoreCircles(data);
+              
+              // Restore layers
+              restoreLayers(data.layers, data.activeLayerId);
+              
+              // Restore canvas settings
+              setAspectRatio(data.aspectRatio);
+              
+              // Restore physics
+              system.config.gravityEnabled = data.physics.gravityEnabled;
+              system.config.gravityStrength = data.physics.gravityStrength;
+              system.config.floorEnabled = data.physics.floorEnabled;
+              system.config.floorY = data.physics.floorY;
+              system.config.wallsEnabled = data.physics.wallsEnabled;
+              system.config.damping = data.physics.damping;
+              setGravity(data.physics.gravityEnabled);
+              setFloor(data.physics.floorEnabled);
+              
+              // Restore collision settings
+              if (data.physics.collisionIterations !== undefined) {
+                setCollisionIterations(data.physics.collisionIterations);
+              }
+              if (data.physics.restitution !== undefined) {
+                setRestitution(data.physics.restitution);
+              }
+              
+              // Restore other settings
+              setBrushSize(data.settings.brushSize);
+              setStickyMode(data.settings.stickyEnabled);
+              setStickyStrength(data.settings.stickyStrength);
+              if (data.settings.clumpEnabled) {
+                setNBodyMode('clump');
+              } else if (data.settings.spreadEnabled) {
+                setNBodyMode('spread');
+              } else {
+                setNBodyMode('off');
+              }
+              
+              // Restore palette
+              setPalette(data.palette);
+              setSelectedSwatch(data.selectedSwatch);
+              
+              // Restore background palette
+              if (data.bgPalette) {
+                setBgPalette(data.bgPalette);
+              }
+              if (data.selectedBgSwatch !== undefined) {
+                setSelectedBgSwatch(data.selectedBgSwatch);
+              }
+              
+              // Initialize undo history with loaded state
+              undoManager.initialize(system.circles);
+              updateUndoRedoState();
+              
+              console.log(`Loaded project: ${data.name} (saved ${new Date(data.savedAt).toLocaleString()})`);
+            }}
+            title="Load project from JSON file"
+          >
+            Load
+          </button>
+          <button 
+            onClick={exitApplication}
+            className="danger"
+            title="Exit application"
+          >
+            Exit
+          </button>
+        </div>
+
+        
           </div>
 
-          {/* Colors & Palette Tab */}
+          {/* COLORS TAB */}
           <div className={`tab-pane ${leftTab === 'colors' ? 'active' : ''}`}>
-            <div className="section-header">Circle Colors</div>
-            
-            <div className="control-group">
-              <span className="swatch-section-label">Palette</span>
-              <div className="swatch-row">
-                {palette.map((color, i) => (
-                  <div
-                    key={i}
-                    className={`swatch ${colorEditMode === 'circle' && selectedSwatch === i ? 'selected' : ''}`}
-                    style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
-                    onClick={() => { setSelectedSwatch(i); setColorEditMode('circle'); }}
-                  />
-                ))}
-              </div>
-            </div>
+     <h2>Draw</h2>
 
-            <div className="section-header">Background Colors</div>
-            
-            <div className="control-group">
-              <span className="swatch-section-label">Palette</span>
-              <div className="swatch-row">
-                {bgPalette.map((color, i) => (
-                  <div
-                    key={i}
-                    className={`swatch ${colorEditMode === 'background' && selectedBgSwatch === i ? 'selected' : ''}`}
-                    style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
-                    onClick={() => { setSelectedBgSwatch(i); setColorEditMode('background'); }}
-                  />
-                ))}
-              </div>
-            </div>
+        <div className="control-group">
+          <label>Circles: {circleCount}</label>
+        </div>
 
-            <div className="section-header">Color Editor</div>
-            
-            <div className="control-group">
-              <label>H: {activeColor.h}</label>
-              <input
-                type="range"
-                className="hue-slider"
-                min="0"
-                max="360"
-                value={activeColor.h}
-                onChange={(e) => updateActiveColor('h', Number(e.target.value))}
+        <div className="control-group">
+          <label>Brush Size: {brushSize}</label>
+          <input
+            type="range"
+            min="10"
+            max="100"
+            value={brushSize}
+            onChange={(e) => setBrushSize(Number(e.target.value))}
+          />
+        </div>
+
+        <h2>Background</h2>
+
+        <div className="control-group">
+          <div className="swatch-row">
+            {bgPalette.map((color, i) => (
+              <div
+                key={i}
+                className={`swatch ${selectedBgSwatch === i ? 'selected' : ''}`}
+                style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                onClick={() => setSelectedBgSwatch(i)}
               />
-            </div>
+            ))}
+          </div>
+        </div>
 
-            <div className="control-group">
-              <label>S: {activeColor.s}%</label>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={activeColor.s}
-                onChange={(e) => updateActiveColor('s', Number(e.target.value))}
-                style={{
-                  background: `linear-gradient(to right, hsl(${activeColor.h}, 0%, ${activeColor.l}%), hsl(${activeColor.h}, 100%, ${activeColor.l}%))`
-                }}
+        <div className="control-group">
+          <label>Hue: {bgPalette[selectedBgSwatch].h}</label>
+          <input
+            type="range"
+            min="0"
+            max="360"
+            value={bgPalette[selectedBgSwatch].h}
+            onChange={(e) => updateBgPalette('h', Number(e.target.value))}
+          className="hue-slider" />
+        </div>
+
+        <div className="control-group">
+          <label>Saturation: {bgPalette[selectedBgSwatch].s}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={bgPalette[selectedBgSwatch].s}
+            onChange={(e) => updateBgPalette('s', Number(e.target.value))}
+            style={{ background: `linear-gradient(to right, hsl(${bgPalette[selectedBgSwatch].h}, 0%, 50%), hsl(${bgPalette[selectedBgSwatch].h}, 100%, 50%))`, height: '4px' }}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Lightness: {bgPalette[selectedBgSwatch].l}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={bgPalette[selectedBgSwatch].l}
+            onChange={(e) => updateBgPalette('l', Number(e.target.value))}
+            style={{ background: `linear-gradient(to right, hsl(${bgPalette[selectedBgSwatch].h}, ${bgPalette[selectedBgSwatch].s}%, 0%), hsl(${bgPalette[selectedBgSwatch].h}, ${bgPalette[selectedBgSwatch].s}%, 50%), hsl(${bgPalette[selectedBgSwatch].h}, ${bgPalette[selectedBgSwatch].s}%, 100%))`, height: '4px' }}
+          />
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={resetBgPalette}
+            title="Reset background palette to defaults"
+          >
+            Reset Backgrounds
+          </button>
+        </div>
+
+        <h2>Color</h2>
+
+        <div className="control-group">
+          <div className="swatch-row">
+            {palette.map((color, i) => (
+              <div
+                key={i}
+                className={`swatch ${selectedSwatch === i ? 'selected' : ''}`}
+                style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                onClick={() => setSelectedSwatch(i)}
               />
-            </div>
+            ))}
+          </div>
+        </div>
 
-            <div className="control-group">
-              <label>L: {activeColor.l}%</label>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={activeColor.l}
-                onChange={(e) => updateActiveColor('l', Number(e.target.value))}
-                style={{
-                  background: `linear-gradient(to right, hsl(${activeColor.h}, ${activeColor.s}%, 0%), hsl(${activeColor.h}, ${activeColor.s}%, 50%), hsl(${activeColor.h}, ${activeColor.s}%, 100%))`
-                }}
-              />
-            </div>
+        <div className="control-group">
+          <label>Hue: {palette[selectedSwatch].h}</label>
+          <input
+            type="range"
+            min="0"
+            max="360"
+            value={palette[selectedSwatch].h}
+            onChange={(e) => updateSwatch('h', Number(e.target.value))}
+          className="hue-slider" />
+        </div>
 
-            <div className="section-divider"></div>
+        <div className="control-group">
+          <label>Saturation: {palette[selectedSwatch].s}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={palette[selectedSwatch].s}
+            style={{ background: `linear-gradient(to right, hsl(${palette[selectedSwatch].h}, 0%, 50%), hsl(${palette[selectedSwatch].h}, 100%, 50%))`, height: '4px' }}
+            onChange={(e) => updateSwatch('s', Number(e.target.value))}
+          />
+        </div>
 
-            <div className="control-group button-row">
-              <button onClick={resetCirclePalette} title="Reset circle colors">
-                Reset C
-              </button>
-              <button onClick={resetBgPalette} title="Reset backgrounds">
-                Reset BG
-              </button>
-            </div>
+        <div className="control-group">
+          <label>Lightness: {palette[selectedSwatch].l}%</label>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            style={{ background: `linear-gradient(to right, hsl(${palette[selectedSwatch].h}, ${palette[selectedSwatch].s}%, 0%), hsl(${palette[selectedSwatch].h}, ${palette[selectedSwatch].s}%, 50%), hsl(${palette[selectedSwatch].h}, ${palette[selectedSwatch].s}%, 100%))`, height: '4px' }}
+            value={palette[selectedSwatch].l}
+            onChange={(e) => updateSwatch('l', Number(e.target.value))}
+          />
+        </div>
 
-            <div className="control-group button-row">
-              <button onClick={savePalettes} title="Save palettes">
-                Save
-              </button>
-              <button onClick={loadPalettes} title="Load palettes">
-                Load
-              </button>
-            </div>
+        <div className="control-group">
+          <button
+            onClick={resetCirclePalette}
+            title="Reset circle palette to defaults"
+          >
+            Reset Colors
+          </button>
+        </div>
+
+        <div className="control-group button-row">
+          <button
+            onClick={savePalettes}
+            title="Save both palettes to file"
+          >
+            Save Palettes
+          </button>
+          <button
+            onClick={loadPalettes}
+            title="Load palettes from file"
+          >
+            Load Palettes
+          </button>
+        </div>
+
+        
           </div>
 
-          {/* Tools Tab */}
+          {/* TOOLS TAB */}
           <div className={`tab-pane ${leftTab === 'tools' ? 'active' : ''}`}>
-            <div className="section-header">Draw</div>
-            
-            <div className="control-group">
-              <label>Circles: {circleCount}</label>
-            </div>
+            <h2>Tools</h2>
 
-            <div className="control-group">
-              <label>Brush Size: {brushSize}</label>
-              <input
-                type="range"
-                min="10"
-                max="100"
-                value={brushSize}
-                onChange={(e) => setBrushSize(Number(e.target.value))}
-              />
-            </div>
+        <div className="control-group button-row">
+          <button 
+            onClick={() => { 
+              saveUndoState(true);
+              clear(); 
+              clearSelection(); 
+              saveUndoState(true);
+            }}
+          >
+            Clear All
+          </button>
+          <button 
+            onClick={performUndo}
+            disabled={!canUndo}
+            title="Undo (Ctrl+Z)"
+          >
+            ↶ Undo
+          </button>
+          <button 
+            onClick={performRedo}
+            disabled={!canRedo}
+            title="Redo (Ctrl+Y)"
+          >
+            ↷ Redo
+          </button>
+        </div>
 
-            <div className="control-group">
-              <label>Auto Spawn</label>
-              <div className="button-row">
-                <button
-                  onMouseDown={() => { isAutoSpawningRef.current = true; }}
-                  onMouseUp={() => { isAutoSpawningRef.current = false; }}
-                  onMouseLeave={() => { isAutoSpawningRef.current = false; }}
-                  onTouchStart={() => { isAutoSpawningRef.current = true; }}
-                  onTouchEnd={() => { isAutoSpawningRef.current = false; }}
-                  className="hold-button"
-                >
-                  Brush
-                </button>
-                <button
-                  onMouseDown={() => { isRandomSpawningRef.current = true; }}
-                  onMouseUp={() => { isRandomSpawningRef.current = false; }}
-                  onMouseLeave={() => { isRandomSpawningRef.current = false; }}
-                  onTouchStart={() => { isRandomSpawningRef.current = true; }}
-                  onTouchEnd={() => { isRandomSpawningRef.current = false; }}
-                  className="hold-button"
-                >
-                  Random
-                </button>
-              </div>
-            </div>
+        <div className="control-group">
+          <label>Hold to spawn circles</label>
+          <div className="button-row">
+            <button
+              onMouseDown={() => { isAutoSpawningRef.current = true; }}
+              onMouseUp={() => { isAutoSpawningRef.current = false; }}
+              onMouseLeave={() => { isAutoSpawningRef.current = false; }}
+              onTouchStart={() => { isAutoSpawningRef.current = true; }}
+              onTouchEnd={() => { isAutoSpawningRef.current = false; }}
+              className="hold-button"
+            >
+              Brush Size
+            </button>
+            <button
+              onMouseDown={() => { isRandomSpawningRef.current = true; }}
+              onMouseUp={() => { isRandomSpawningRef.current = false; }}
+              onMouseLeave={() => { isRandomSpawningRef.current = false; }}
+              onTouchStart={() => { isRandomSpawningRef.current = true; }}
+              onTouchEnd={() => { isRandomSpawningRef.current = false; }}
+              className="hold-button"
+            >
+              Random Size
+            </button>
+          </div>
+        </div>
 
-            <div className="section-header">Edit Modes</div>
-            
-            <div className="control-group button-row">
-              <button
-                onClick={() => {
-                  setEraseMode(!eraseMode);
-                  if (!eraseMode) { setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
-                }}
-                className={eraseMode ? "active danger" : ""}
-              >
-                Erase
-              </button>
-              <button
-                onClick={() => {
-                  setRecolorMode(!recolorMode);
-                  if (!recolorMode) { setEraseMode(false); setLockMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); }
-                }}
-                className={recolorMode ? "active info" : ""}
-              >
+        <div className="control-group">
+          <button
+            onClick={() => {
+              setEraseMode(!eraseMode);
+              if (!eraseMode) { setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={eraseMode ? "active danger" : ""}
+          >
+            Erase {eraseMode ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group button-row">
+          <button
+            onClick={() => {
+              setLockMode(!lockMode);
+              if (!lockMode) { setEraseMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={lockMode ? "active warning" : ""}
+          >
+            Lock {lockMode ? "ON" : "OFF"}
+          </button>
+          <button
+            onClick={unlockAll}
+            title="Unlock all circles"
+          >
+            Unlock All
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => {
+              setRecolorMode(!recolorMode);
+              if (!recolorMode) { setEraseMode(false); setLockMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); }
+            }}
+            className={recolorMode ? "active info" : ""}
+          >
+            Recolor {recolorMode ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => {
+              setSelectMode(!selectMode);
+              if (!selectMode) { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); }
+              else { clearSelection(); }
+            }}
+            className={selectMode ? "active info" : ""}
+          >
+            Select {selectMode ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        {selectedIds.size > 0 && (
+          <div className="control-group selection-actions">
+            <label>Selected: {selectedIds.size} circles</label>
+            <div className="button-row">
+              <button onClick={recolorSelection} className="info" title="Recolor selected circles">
                 Recolor
               </button>
-            </div>
-
-            <div className="control-group button-row">
-              <button
-                onClick={() => {
-                  setLockMode(!lockMode);
-                  if (!lockMode) { setEraseMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); setSelectMode(false); clearSelection(); }
-                }}
-                className={lockMode ? "active warning" : ""}
-              >
-                Lock
+              <button onClick={deleteSelection} className="danger" title="Delete selected circles">
+                Delete
               </button>
-              <button onClick={unlockAll}>
-                Unlock All
-              </button>
-            </div>
-
-            <div className="section-header">Selection</div>
-            
-            <div className="control-group">
-              <button
-                onClick={() => {
-                  setSelectMode(!selectMode);
-                  if (!selectMode) { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setFlowMode('off'); }
-                  else { clearSelection(); }
-                }}
-                className={selectMode ? "active info" : ""}
-              >
-                Select {selectMode ? "ON" : "OFF"}
-              </button>
-            </div>
-
-            <div className="control-group button-row">
-              <button onClick={selectAll}>
-                Select All
-              </button>
-              <button onClick={invertSelection}>
+              <button onClick={invertSelection} title="Invert selection">
                 Invert
               </button>
             </div>
-
-            {selectedIds.size > 0 && (
-              <div className="control-group selection-actions">
-                <label>Selected: {selectedIds.size} circles</label>
-                <div className="button-row">
-                  <button onClick={recolorSelection} className="info">
-                    Recolor
-                  </button>
-                  <button onClick={deleteSelection} className="danger">
-                    Delete
-                  </button>
-                  <button onClick={invertSelection}>
-                    Invert
-                  </button>
-                </div>
-                <div className="button-row">
-                  <button onClick={lockInverse}>
-                    Lock Inverse
-                  </button>
-                  <button onClick={unlockAll}>
-                    Unlock All
-                  </button>
-                </div>
-              </div>
-            )}
-
-            <div className="section-header">Undo / Redo</div>
-            
-            <div className="control-group button-row">
-              <button 
-                onClick={() => { 
-                  saveUndoState(true);
-                  clear(); 
-                  clearSelection(); 
-                  saveUndoState(true);
-                }}
-                title="Clear all"
-              >
-                Clear All
+            <div className="button-row">
+              <button onClick={lockInverse} title="Lock all circles that are NOT selected">
+                Lock Inverse
               </button>
-              <button 
-                onClick={performUndo}
-                disabled={!canUndo}
-                title="Undo (Ctrl+Z)"
-              >
-                ↶ Undo
-              </button>
-              <button 
-                onClick={performRedo}
-                disabled={!canRedo}
-                title="Redo (Ctrl+Y)"
-              >
-                ↷ Redo
+              <button onClick={unlockAll} title="Unlock all circles">
+                Unlock All
               </button>
             </div>
           </div>
+        )}
+
+        
+          </div>
+
+          {/* PHYSICS TAB */}
+          <div className={`tab-pane ${leftTab === 'physics' ? 'active' : ''}`}> 
+            <h2>Magnet</h2>
+
+        <div className="control-group button-row">
+          <button
+            onClick={() => {
+              const newMode = magnetMode === 'attract' ? 'off' : 'attract';
+              setMagnetMode(newMode);
+              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={magnetMode === 'attract' ? "active" : ""}
+          >
+            Attract
+          </button>
+          <button
+            onClick={() => {
+              const newMode = magnetMode === 'repel' ? 'off' : 'repel';
+              setMagnetMode(newMode);
+              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setFlowMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={magnetMode === 'repel' ? "active danger" : ""}
+          >
+            Repel
+          </button>
         </div>
-      </aside>
+
+        <div className="control-group">
+          <label>Strength: {magnetStrength}</label>
+          <input
+            type="range"
+            min="1"
+            max="10"
+            value={magnetStrength}
+            onChange={(e) => setMagnetStrength(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Radius: {magnetRadius}</label>
+          <input
+            type="range"
+            min="50"
+            max="500"
+            value={magnetRadius}
+            onChange={(e) => setMagnetRadius(Number(e.target.value))}
+          />
+        </div>
+
+        <h2>Physics</h2>
+
+        <div className="control-group">
+          <button
+            onClick={() => setPhysicsPaused(!physicsPaused)}
+            className={physicsPaused ? "active warning" : ""}
+            title={physicsPaused ? "Resume physics simulation" : "Pause physics (use if app becomes unresponsive)"}
+          >
+            {physicsPaused ? "▶ Resume" : "⏸ Pause"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => setGravity(!config.gravityEnabled)}
+            className={config.gravityEnabled ? "active" : ""}
+          >
+            Gravity {config.gravityEnabled ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => setWalls(!config.wallsEnabled)}
+            className={config.wallsEnabled ? "active" : ""}
+          >
+            Walls {config.wallsEnabled ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => setFloor(!config.floorEnabled)}
+            className={config.floorEnabled ? "active" : ""}
+          >
+            Floor {config.floorEnabled ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <label>Collision Accuracy: {collisionIterations}</label>
+          <input
+            type="range"
+            min="1"
+            max="8"
+            step="1"
+            value={collisionIterations}
+            onChange={(e) => setCollisionIterations(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Bounciness: {restitution.toFixed(2)}</label>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={restitution}
+            onChange={(e) => setRestitution(Number(e.target.value))}
+          />
+        </div>
+
+        <h2>Forces</h2>
+
+        <div className="control-group button-row">
+          <button
+            onClick={() => setNBodyMode(nBodyMode === 'clump' ? 'off' : 'clump')}
+            className={nBodyMode === 'clump' ? "active" : ""}
+          >
+            Clump
+          </button>
+          <button
+            onClick={() => setNBodyMode(nBodyMode === 'spread' ? 'off' : 'spread')}
+            className={nBodyMode === 'spread' ? "active danger" : ""}
+          >
+            Spread
+          </button>
+        </div>
+
+        <div className="control-group">
+          <label>Strength: {nBodyStrength.toFixed(1)}</label>
+          <input
+            type="range"
+            min="0.5"
+            max="5"
+            step="0.1"
+            value={nBodyStrength}
+            onChange={(e) => setNBodyStrength(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => setStickyMode(!stickyMode)}
+            className={stickyMode ? "active warning" : ""}
+          >
+            Sticky {stickyMode ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <label>Sticky Strength: {stickyStrength.toFixed(2)}</label>
+          <input
+            type="range"
+            min="0.05"
+            max="0.4"
+            step="0.01"
+            value={stickyStrength}
+            onChange={(e) => setStickyStrength(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <button
+            onClick={() => setTurbulenceMode(!turbulenceMode)}
+            className={turbulenceMode ? "active danger" : ""}
+          >
+            Turbulence {turbulenceMode ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        <div className="control-group">
+          <label>Strength: {turbulenceStrength.toFixed(1)}</label>
+          <input
+            type="range"
+            min="0"
+            max="5"
+            step="0.1"
+            value={turbulenceStrength}
+            onChange={(e) => setTurbulenceStrength(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Scale: {turbulenceScale}</label>
+          <input
+            type="range"
+            min="20"
+            max="300"
+            step="10"
+            value={turbulenceScale}
+            onChange={(e) => setTurbulenceScale(Number(e.target.value))}
+            title="Noise table size - larger = broader patterns"
+          />
+        </div>
+
+        <div className="control-group">
+          <label>Speed: {turbulenceFrequency.toFixed(2)}</label>
+          <input
+            type="range"
+            min="0"
+            max="2"
+            step="0.05"
+            value={turbulenceFrequency}
+            onChange={(e) => setTurbulenceFrequency(Number(e.target.value))}
+            title="Animation speed of turbulence"
+          />
+        </div>
+      
+        </div>
+      </div>
+    </aside>
 
       {/* Canvas Area */}
       <main className="canvas-container">
@@ -2555,10 +2958,12 @@ function App() {
         <canvas
           ref={canvasRef}
           style={{ cursor: eraseMode ? 'not-allowed' : lockMode ? 'pointer' : recolorMode ? 'cell' : selectMode ? 'crosshair' : magnetMode !== 'off' ? 'move' : flowMode === 'draw' ? 'crosshair' : flowMode === 'erase' ? 'not-allowed' : 'crosshair' }}
+          // Mouse events
           onMouseDown={handlePointerDown}
           onMouseMove={handlePointerMove}
           onMouseUp={handlePointerUp}
           onMouseLeave={handlePointerUp}
+          // Touch events
           onTouchStart={handlePointerDown}
           onTouchMove={handlePointerMove}
           onTouchEnd={handlePointerUp}
@@ -2566,14 +2971,16 @@ function App() {
         />
       </main>
 
-      {/* Right Panel with Tabs */}
+      {/* Right Panel */}
       <aside className="panel right-panel">
+        
+        {/* Tab Navigation */}
         <div className="tab-nav">
           <button 
-            className={`tab-button ${rightTab === 'physics' ? 'active' : ''}`}
-            onClick={() => setRightTab('physics')}
+            className={`tab-button ${rightTab === 'effects' ? 'active' : ''}`}
+            onClick={() => setRightTab('effects')}
           >
-            Physics
+            Effects
           </button>
           <button 
             className={`tab-button ${rightTab === 'layers' ? 'active' : ''}`}
@@ -2583,470 +2990,284 @@ function App() {
           </button>
         </div>
 
+        {/* Tab Content */}
         <div className="tab-content">
-          {/* Physics Tab */}
-          <div className={`tab-pane ${rightTab === 'physics' ? 'active' : ''}`}>
-            <div className="section-header">Physics</div>
-            
-            <div className="control-group">
-              <button 
-                onClick={() => setPhysicsPaused(!physicsPaused)}
-                className={physicsPaused ? "warning" : "active"}
-              >
-                {physicsPaused ? "⏸ Paused" : "▶ Running"}
-              </button>
-            </div>
+          {/* EFFECTS TAB */}
+          <div className={`tab-pane ${rightTab === 'effects' ? 'active' : ''}`}>
+            <h2>Flow Field</h2>
 
-            <div className="section-header">Gravity</div>
-            
-            <div className="control-group">
-              <button
-                onClick={() => setGravity(!config.gravityEnabled)}
-                className={config.gravityEnabled ? "active" : ""}
-              >
-                Gravity {config.gravityEnabled ? "ON" : "OFF"}
-              </button>
-            </div>
+        <div className="control-group button-row">
+          <button
+            onClick={() => {
+              const newMode = flowMode === 'draw' ? 'off' : 'draw';
+              setFlowMode(newMode);
+              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={flowMode === 'draw' ? "active" : ""}
+          >
+            Draw
+          </button>
+          <button
+            onClick={() => {
+              const newMode = flowMode === 'erase' ? 'off' : 'erase';
+              setFlowMode(newMode);
+              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
+            }}
+            className={flowMode === 'erase' ? "active danger" : ""}
+          >
+            Erase
+          </button>
+        </div>
 
-            {config.gravityEnabled && (
-              <div className="control-group">
-                <label>Strength: {config.gravityStrength.toFixed(2)}</label>
-                <input
-                  type="range"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  value={config.gravityStrength}
-                  onChange={(e) => {
-                    system.config.gravityStrength = Number(e.target.value);
-                  }}
-                />
-              </div>
-            )}
+        <div className="control-group">
+          <button
+            onClick={() => setFlowVisible(!flowVisible)}
+            className={flowVisible ? "active" : ""}
+          >
+            Visible {flowVisible ? "ON" : "OFF"}
+          </button>
+        </div>
 
-            <div className="section-header">Boundaries</div>
-            
-            <div className="control-group">
-              <button
-                onClick={() => setWalls(!config.wallsEnabled)}
-                className={config.wallsEnabled ? "active" : ""}
-              >
-                Walls {config.wallsEnabled ? "ON" : "OFF"}
-              </button>
-            </div>
+        <div className="control-group">
+          <button onClick={() => system.clearFlowField()}>
+            Clear All
+          </button>
+        </div>
 
-            <div className="control-group">
-              <button
-                onClick={() => setFloor(!config.floorEnabled)}
-                className={config.floorEnabled ? "active" : ""}
-              >
-                Floor {config.floorEnabled ? "ON" : "OFF"}
-              </button>
-            </div>
+        <div className="control-group">
+          <label>Strength: {flowStrength.toFixed(2)}</label>
+          <input
+            type="range"
+            min="0"
+            max="0.5"
+            step="0.01"
+            value={flowStrength}
+            onChange={(e) => setFlowStrength(Number(e.target.value))}
+          />
+        </div>
 
-            <div className="section-header">Collisions</div>
-            
-            <div className="control-group">
-              <label>Iterations: {collisionIterations}</label>
-              <input
-                type="range"
-                min="1"
-                max="10"
-                value={collisionIterations}
-                onChange={(e) => setCollisionIterations(Number(e.target.value))}
-              />
-            </div>
+        <div className="control-group">
+          <label>Radius: {flowRadius}</label>
+          <input
+            type="range"
+            min="50"
+            max="300"
+            value={flowRadius}
+            onChange={(e) => setFlowRadius(Number(e.target.value))}
+          />
+        </div>
 
-            <div className="control-group">
-              <label>Bounciness: {restitution.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={restitution}
-                onChange={(e) => setRestitution(Number(e.target.value))}
-              />
-            </div>
-
-            <div className="control-group">
-              <label>Damping: {config.damping.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0.9"
-                max="1"
-                step="0.01"
-                value={config.damping}
-                onChange={(e) => {
-                  system.config.damping = Number(e.target.value);
-                }}
-              />
-            </div>
-
-            <div className="section-header">Forces</div>
-            
-            <div className="control-group">
-              <label>Magnet</label>
-              <div className="button-row">
-                <button
-                  onClick={() => setMagnetMode('off')}
-                  className={magnetMode === 'off' ? 'active' : ''}
-                >
-                  Off
-                </button>
-                <button
-                  onClick={() => setMagnetMode('attract')}
-                  className={magnetMode === 'attract' ? 'active info' : ''}
-                >
-                  Attract
-                </button>
-                <button
-                  onClick={() => setMagnetMode('repel')}
-                  className={magnetMode === 'repel' ? 'active danger' : ''}
-                >
-                  Repel
-                </button>
-              </div>
-            </div>
-
-            {magnetMode !== 'off' && (
-              <>
-                <div className="control-group">
-                  <label>Strength: {magnetStrength.toFixed(1)}</label>
-                  <input
-                    type="range"
-                    min="0.5"
-                    max="10"
-                    step="0.5"
-                    value={magnetStrength}
-                    onChange={(e) => setMagnetStrength(Number(e.target.value))}
-                  />
-                </div>
-                <div className="control-group">
-                  <label>Radius: {magnetRadius}</label>
-                  <input
-                    type="range"
-                    min="50"
-                    max="500"
-                    step="10"
-                    value={magnetRadius}
-                    onChange={(e) => setMagnetRadius(Number(e.target.value))}
-                  />
-                </div>
-              </>
-            )}
-
-            <div className="control-group">
-              <label>N-Body Force</label>
-              <div className="button-row">
-                <button
-                  onClick={() => setNBodyMode('off')}
-                  className={nBodyMode === 'off' ? 'active' : ''}
-                >
-                  Off
-                </button>
-                <button
-                  onClick={() => setNBodyMode('clump')}
-                  className={nBodyMode === 'clump' ? 'active info' : ''}
-                >
-                  Clump
-                </button>
-                <button
-                  onClick={() => setNBodyMode('spread')}
-                  className={nBodyMode === 'spread' ? 'active danger' : ''}
-                >
-                  Spread
-                </button>
-              </div>
-            </div>
-
-            {nBodyMode !== 'off' && (
-              <div className="control-group">
-                <label>Strength: {nBodyStrength.toFixed(1)}</label>
-                <input
-                  type="range"
-                  min="0.5"
-                  max="5"
-                  step="0.1"
-                  value={nBodyStrength}
-                  onChange={(e) => setNBodyStrength(Number(e.target.value))}
-                />
-              </div>
-            )}
-
-            <div className="control-group">
-              <button
-                onClick={() => setStickyMode(!stickyMode)}
-                className={stickyMode ? "active" : ""}
-              >
-                Sticky {stickyMode ? "ON" : "OFF"}
-              </button>
-            </div>
-
-            {stickyMode && (
-              <div className="control-group">
-                <label>Strength: {stickyStrength.toFixed(2)}</label>
-                <input
-                  type="range"
-                  min="0"
-                  max="0.5"
-                  step="0.05"
-                  value={stickyStrength}
-                  onChange={(e) => setStickyStrength(Number(e.target.value))}
-                />
-              </div>
-            )}
-
-            <div className="section-header">Flow Field</div>
-            
-            <div className="control-group">
-              <div className="button-row">
-                <button
-                  onClick={() => setFlowMode('off')}
-                  className={flowMode === 'off' ? 'active' : ''}
-                >
-                  Off
-                </button>
-                <button
-                  onClick={() => setFlowMode('draw')}
-                  className={flowMode === 'draw' ? 'active info' : ''}
-                >
-                  Draw
-                </button>
-                <button
-                  onClick={() => setFlowMode('erase')}
-                  className={flowMode === 'erase' ? 'active danger' : ''}
-                >
-                  Erase
-                </button>
-              </div>
-            </div>
-
-            <div className="control-group">
-              <button
-                onClick={() => setFlowVisible(!flowVisible)}
-                className={flowVisible ? "active" : ""}
-              >
-                Show Vectors {flowVisible ? "ON" : "OFF"}
-              </button>
-            </div>
-
-            {system.flowVectors.length > 0 && (
-              <div className="control-group">
-                <button
-                  onClick={() => system.clearFlowField()}
-                  className="danger"
-                >
-                  Clear All Vectors
-                </button>
-              </div>
-            )}
-
-            <div className="control-group">
-              <label>Strength: {flowStrength.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0"
-                max="0.5"
-                step="0.05"
-                value={flowStrength}
-                onChange={(e) => setFlowStrength(Number(e.target.value))}
-              />
-            </div>
-
-            <div className="control-group">
-              <label>Radius: {flowRadius}</label>
-              <input
-                type="range"
-                min="50"
-                max="300"
-                step="10"
-                value={flowRadius}
-                onChange={(e) => setFlowRadius(Number(e.target.value))}
-              />
-            </div>
-
-            <div className="section-header">Scaling</div>
-            
-            <div className="control-group">
-              <label>Scale All</label>
-              <input
-                type="range"
-                min="-1"
-                max="1"
-                step="0.01"
-                value={scaleSliderRef.current}
-                onChange={(e) => {
-                  scaleSliderRef.current = Number(e.target.value);
-                }}
-                onMouseDown={() => { isScalingRef.current = true; }}
-                onMouseUp={() => { isScalingRef.current = false; }}
-                onMouseLeave={() => { isScalingRef.current = false; }}
-                onTouchStart={() => { isScalingRef.current = true; }}
-                onTouchEnd={() => { isScalingRef.current = false; }}
-                style={{
-                  background: `linear-gradient(to right, #ff6b6b 0%, #666 50%, #4ecdc4 100%)`
-                }}
-              />
-              <span className="slider-hint">← Shrink | Grow →</span>
-            </div>
-
-            <div className="control-group">
-              <label>Scale Random</label>
-              <input
-                type="range"
-                min="-1"
-                max="1"
-                step="0.01"
-                value={randomScaleSliderRef.current}
-                onChange={(e) => {
-                  randomScaleSliderRef.current = Number(e.target.value);
-                }}
-                onMouseDown={() => { isRandomScalingRef.current = true; }}
-                onMouseUp={() => { isRandomScalingRef.current = false; }}
-                onMouseLeave={() => { isRandomScalingRef.current = false; }}
-                onTouchStart={() => { isRandomScalingRef.current = true; }}
-                onTouchEnd={() => { isRandomScalingRef.current = false; }}
-                style={{
-                  background: `linear-gradient(to right, #ff6b6b 0%, #666 50%, #4ecdc4 100%)`
-                }}
-              />
-              <span className="slider-hint">← Chaos | Chaos →</span>
-            </div>
-          </div>
-
-          {/* Layers Tab */}
-          <div className={`tab-pane ${rightTab === 'layers' ? 'active' : ''}`}>
-            <div className="section-header">Layer Management</div>
-            
-            <div className="control-group button-row">
-              <button onClick={() => addCircleLayer()}>+ Circles</button>
-              <button onClick={() => addPaintLayer()}>+ Paint</button>
-            </div>
-            
-            <div className="layer-list">
-              {[...layers].reverse().map((layer) => (
-                <div 
-                  key={layer.id}
-                  className={`layer-item ${layer.id === activeLayerId ? 'active' : ''}`}
-                  onClick={() => setActiveLayerId(layer.id)}
-                >
-                  <div className="layer-info">
-                    <span className="layer-type">{layer.type === 'circles' ? '●' : '◐'}</span>
-                    <span className="layer-name">{layer.name}</span>
-                  </div>
-                  <div className="layer-controls">
-                    <button 
-                      className={`layer-btn ${layer.visible ? '' : 'off'}`}
-                      onClick={(e) => { e.stopPropagation(); toggleVisibility(layer.id); }}
-                      title="Toggle visibility"
-                    >
-                      {layer.visible ? '👁' : '○'}
-                    </button>
-                    <button 
-                      className={`layer-btn ${layer.locked ? 'on' : ''}`}
-                      onClick={(e) => { e.stopPropagation(); toggleLock(layer.id); }}
-                      title="Toggle lock"
-                    >
-                      {layer.locked ? '🔒' : '○'}
-                    </button>
-                    <button 
-                      className="layer-btn"
-                      onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }}
-                      title="Move up"
-                    >
-                      ↑
-                    </button>
-                    <button 
-                      className="layer-btn"
-                      onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'down'); }}
-                      title="Move down"
-                    >
-                      ↓
-                    </button>
-                    {layers.length > 1 && (
-                      <button 
-                        className="layer-btn danger"
-                        onClick={(e) => { e.stopPropagation(); removeLayer(layer.id); }}
-                        title="Delete layer"
-                      >
-                        ×
-                      </button>
-                    )}
-                  </div>
-                  <div className="layer-opacity" onClick={(e) => e.stopPropagation()}>
-                    <span className="opacity-label">α</span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={layer.opacity}
-                      onChange={(e) => updateLayer(layer.id, { opacity: Number(e.target.value) })}
-                      title={`Opacity: ${Math.round(layer.opacity * 100)}%`}
-                    />
-                  </div>
-                </div>
-              ))}
-            </div>
-            
-            {getActiveLayer()?.type === 'paint' && (
-              <>
-                <div className="section-header">Paint Settings</div>
-                
-                <div className="control-group">
-                  <button
-                    onClick={() => setPaintMode(!paintMode)}
-                    className={paintMode ? "active" : ""}
-                  >
-                    Paint {paintMode ? "ON" : "OFF"}
-                  </button>
-                </div>
-                
-                <div className="control-group">
-                  <label>Wetness: {brush.getSettings().wetness.toFixed(2)}</label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={brush.getSettings().wetness}
-                    onChange={(e) => brush.setSettings({ wetness: Number(e.target.value) })}
-                  />
-                </div>
-                
-                <div className="control-group">
-                  <label>Flow: {brush.getSettings().flow.toFixed(2)}</label>
-                  <input
-                    type="range"
-                    min="0.1"
-                    max="1"
-                    step="0.05"
-                    value={brush.getSettings().flow}
-                    onChange={(e) => brush.setSettings({ flow: Number(e.target.value) })}
-                  />
-                </div>
-                
-                <div className="control-group">
-                  <label>Bleed: {brush.getSettings().bleedStrength.toFixed(2)}</label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={brush.getSettings().bleedStrength}
-                    onChange={(e) => brush.setSettings({ bleedStrength: Number(e.target.value) })}
-                  />
-                </div>
-                
-                <div className="control-group">
-                  <button onClick={() => clearPaintLayer(activeLayerId)}>Clear Paint</button>
-                </div>
-              </>
-            )}
+        <h2>Scale All</h2>
+        
+        <div className="control-group">
+          <label>Hold & drag to scale</label>
+          <div className="spring-slider">
+            <span className="slider-label">−</span>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              value={scaleSliderValue}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setScaleSliderValue(val);
+                scaleSliderRef.current = val / 100;
+              }}
+              onMouseDown={() => { isScalingRef.current = true; }}
+              onMouseUp={() => {
+                isScalingRef.current = false;
+                scaleSliderRef.current = 0;
+                setScaleSliderValue(0);
+              }}
+              onMouseLeave={() => {
+                if (isScalingRef.current) {
+                  isScalingRef.current = false;
+                  scaleSliderRef.current = 0;
+                  setScaleSliderValue(0);
+                }
+              }}
+              onTouchStart={() => { isScalingRef.current = true; }}
+              onTouchEnd={() => {
+                isScalingRef.current = false;
+                scaleSliderRef.current = 0;
+                setScaleSliderValue(0);
+              }}
+            />
+            <span className="slider-label">+</span>
           </div>
         </div>
-      </aside>
+
+        <h2>Random Scale</h2>
+        
+        <div className="control-group">
+          <label>Hold & drag to randomize</label>
+          <div className="spring-slider">
+            <span className="slider-label">−</span>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              value={randomScaleSliderValue}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setRandomScaleSliderValue(val);
+                randomScaleSliderRef.current = val / 100;
+              }}
+              onMouseDown={() => { isRandomScalingRef.current = true; }}
+              onMouseUp={() => {
+                isRandomScalingRef.current = false;
+                randomScaleSliderRef.current = 0;
+                setRandomScaleSliderValue(0);
+              }}
+              onMouseLeave={() => {
+                if (isRandomScalingRef.current) {
+                  isRandomScalingRef.current = false;
+                  randomScaleSliderRef.current = 0;
+                  setRandomScaleSliderValue(0);
+                }
+              }}
+              onTouchStart={() => { isRandomScalingRef.current = true; }}
+              onTouchEnd={() => {
+                isRandomScalingRef.current = false;
+                randomScaleSliderRef.current = 0;
+                setRandomScaleSliderValue(0);
+              }}
+            />
+            <span className="slider-label">+</span>
+          </div>
+        </div>
+
+        
+          </div>
+
+          {/* LAYERS TAB */}
+          <div className={`tab-pane ${rightTab === 'layers' ? 'active' : ''}`}>
+            <h2>Layers</h2>
+        
+        <div className="control-group button-row">
+          <button onClick={() => addCircleLayer()}>+ Circles</button>
+          <button onClick={() => addPaintLayer()}>+ Paint</button>
+        </div>
+        
+        <div className="layer-list">
+          {[...layers].reverse().map((layer) => (
+            <div 
+              key={layer.id}
+              className={`layer-item ${layer.id === activeLayerId ? 'active' : ''}`}
+              onClick={() => setActiveLayerId(layer.id)}
+            >
+              <div className="layer-info">
+                <span className="layer-type">{layer.type === 'circles' ? '●' : '◐'}</span>
+                <span className="layer-name">{layer.name}</span>
+              </div>
+              <div className="layer-controls">
+                <button 
+                  className={`layer-btn ${layer.visible ? '' : 'off'}`}
+                  onClick={(e) => { e.stopPropagation(); toggleVisibility(layer.id); }}
+                  title="Toggle visibility"
+                >
+                  {layer.visible ? '👁' : '○'}
+                </button>
+                <button 
+                  className={`layer-btn ${layer.locked ? 'on' : ''}`}
+                  onClick={(e) => { e.stopPropagation(); toggleLock(layer.id); }}
+                  title="Toggle lock"
+                >
+                  {layer.locked ? '🔒' : '○'}
+                </button>
+                <button 
+                  className="layer-btn"
+                  onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }}
+                  title="Move up"
+                >
+                  ↑
+                </button>
+                <button 
+                  className="layer-btn"
+                  onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'down'); }}
+                  title="Move down"
+                >
+                  ↓
+                </button>
+                {layers.length > 1 && (
+                  <button 
+                    className="layer-btn danger"
+                    onClick={(e) => { e.stopPropagation(); removeLayer(layer.id); }}
+                    title="Delete layer"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+              <div className="layer-opacity" onClick={(e) => e.stopPropagation()}>
+                <span className="opacity-label">α</span>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={layer.opacity}
+                  onChange={(e) => updateLayer(layer.id, { opacity: Number(e.target.value) })}
+                  title={`Opacity: ${Math.round(layer.opacity * 100)}%`}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+        
+        {getActiveLayer()?.type === 'paint' && (
+          <>
+            <h3>Paint Settings</h3>
+            <div className="control-group">
+              <button
+                onClick={() => setPaintMode(!paintMode)}
+                className={paintMode ? "active" : ""}
+              >
+                Paint {paintMode ? "ON" : "OFF"}
+              </button>
+            </div>
+            <div className="control-group">
+              <label>Wetness: {brush.getSettings().wetness.toFixed(2)}</label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={brush.getSettings().wetness}
+                onChange={(e) => brush.setSettings({ wetness: Number(e.target.value) })}
+              />
+            </div>
+            <div className="control-group">
+              <label>Flow: {brush.getSettings().flow.toFixed(2)}</label>
+              <input
+                type="range"
+                min="0.1"
+                max="1"
+                step="0.05"
+                value={brush.getSettings().flow}
+                onChange={(e) => brush.setSettings({ flow: Number(e.target.value) })}
+              />
+            </div>
+            <div className="control-group">
+              <label>Bleed: {brush.getSettings().bleedStrength.toFixed(2)}</label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={brush.getSettings().bleedStrength}
+                onChange={(e) => brush.setSettings({ bleedStrength: Number(e.target.value) })}
+              />
+            </div>
+            <div className="control-group">
+              <button onClick={() => clearPaintLayer(activeLayerId)}>Clear Paint</button>
+            </div>
+          </>
+        )}
+      
+        </div>
+      </div>
+    </aside>
     </div>
   );
 }

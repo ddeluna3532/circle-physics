@@ -73,6 +73,28 @@ export class AnimationRecorder {
     
     console.log(`Recording started at ${this.fps} FPS`);
   }
+  
+  // Continue recording - appends to existing animation
+  continueRecording(circles: Circle[]): void {
+    if (this.keyframes.length === 0) {
+      // No existing animation, start fresh
+      this.startRecording(circles);
+      return;
+    }
+    
+    // Get the last frame's time and add a small gap
+    const lastTime = this.keyframes[this.keyframes.length - 1].time;
+    this.startTime = performance.now() - lastTime;
+    this.isRecording = true;
+    
+    // Set up interval for capturing frames
+    const intervalMs = 1000 / this.fps;
+    this.recordInterval = window.setInterval(() => {
+      // Note: circles array is captured by reference, will get current state
+    }, intervalMs);
+    
+    console.log(`Recording continued from ${(lastTime / 1000).toFixed(2)}s`);
+  }
 
   // Capture a frame (called from animation loop)
   captureFrame(circles: Circle[]): void {

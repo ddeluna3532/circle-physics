@@ -1,3 +1,4 @@
+import React from "react";
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { usePhysics, useLayers } from "./hooks";
 import { Circle } from "./physics";
@@ -178,6 +179,8 @@ function App() {
   // Color palette state
   const [palette, setPalette] = useState(DEFAULT_CIRCLE_PALETTE);
   const [selectedSwatch, setSelectedSwatch] = useState(0);
+  const [enabledSwatches, setEnabledSwatches] = useState<boolean[]>(new Array(DEFAULT_CIRCLE_PALETTE.length).fill(true));
+  const enabledSwatchesRef = useRef<boolean[]>(new Array(DEFAULT_CIRCLE_PALETTE.length).fill(true));
   
   // Background palette state
   const [bgPalette, setBgPalette] = useState(DEFAULT_BG_PALETTE);
@@ -319,19 +322,31 @@ function App() {
   const isPaintSelectingRef = useRef(false); // Paint selection mode
   const paintSelectedThisStroke = useRef<Set<number>>(new Set()); // Track circles selected this stroke
 
-  // Generate color from selected swatch with slight variation
-  const getColor = useCallback(() => {
-    const swatch = palette[selectedSwatch];
-    const h = swatch.h + Math.random() * 10 - 5;
-    return `hsl(${h}, ${swatch.s}%, ${swatch.l}%)`;
-  }, [palette, selectedSwatch]);
-  
-  // Get random color from any swatch in the palette
-  const getRandomPaletteColor = useCallback(() => {
-    const swatch = palette[Math.floor(Math.random() * palette.length)];
-    const h = swatch.h + Math.random() * 10 - 5;
-    return `hsl(${h}, ${swatch.s}%, ${swatch.l}%)`;
+  // Get random color from any ENABLED swatch in the palette
+  const getRandomPaletteColor = useCallback((): string | null => {
+    const enabledIndices: number[] = [];
+    for (let i = 0; i < palette.length; i++) {
+      if (enabledSwatchesRef.current[i]) enabledIndices.push(i);
+    }
+    if (enabledIndices.length === 0) {
+      console.warn('No enabled swatches; recolor aborted');
+      return null;
+    }
+    const randomEnabledIndex = enabledIndices[Math.floor(Math.random() * enabledIndices.length)];
+    const swatch = palette[randomEnabledIndex];
+    return `hsl(${swatch.h}, ${swatch.s}%, ${swatch.l}%)`;
   }, [palette]);
+
+  // Generate color from selected swatch (exact color or random from enabled)
+  const [useRandomEnabledSwatches, setUseRandomEnabledSwatches] = useState(false);
+  const getColor = useCallback(() => {
+    if (useRandomEnabledSwatches) {
+      const c = getRandomPaletteColor();
+      if (c) return c;
+    }
+    const swatch = palette[selectedSwatch];
+    return `hsl(${swatch.h}, ${swatch.s}%, ${swatch.l}%)`;
+  }, [useRandomEnabledSwatches, palette, selectedSwatch, getRandomPaletteColor]);
   
   // Update a specific HSL value for the selected swatch
   const updateSwatch = (key: 'h' | 's' | 'l', value: number) => {
@@ -341,6 +356,74 @@ function App() {
       return newPalette;
     });
   };
+
+  // Toggle swatch enabled/disabled for recoloring
+  const toggleSwatchEnabled = (index: number) => {
+    setEnabledSwatches(prev => {
+      const updated = [...prev];
+      updated[index] = !updated[index];
+      enabledSwatchesRef.current = updated;
+      return updated;
+    });
+  };
+
+  // Enable all swatches
+  const enableAllSwatches = () => {
+    const allEnabled = new Array(palette.length).fill(true);
+    setEnabledSwatches(allEnabled);
+    enabledSwatchesRef.current = allEnabled;
+  };
+
+  // Disable all swatches
+  const disableAllSwatches = () => {
+    const allDisabled = new Array(palette.length).fill(false);
+    setEnabledSwatches(allDisabled);
+    enabledSwatchesRef.current = allDisabled;
+  };
+
+  // Find which swatch a circle's color matches (with fuzzy matching for variations)
+  const findCircleSwatchIndex = useCallback((circle: Circle): number => {
+    // Parse the circle's HSL color
+    const match = circle.color.match(/hsl\(([\d.]+),\s*([\d.]+)%,\s*([\d.]+)%\)/);
+    if (!match) return -1;
+    
+    const [, hStr, sStr, lStr] = match;
+    const circleH = parseFloat(hStr);
+    const circleS = parseFloat(sStr);
+    const circleL = parseFloat(lStr);
+    
+    // Find closest matching swatch (within tolerance)
+    for (let i = 0; i < palette.length; i++) {
+      const swatch = palette[i];
+      
+      // Allow ±10 for hue (due to random variation in getRandomPaletteColor)
+      // Allow ±2 for saturation and lightness
+      const hDiff = Math.abs(circleH - swatch.h);
+      const sDiff = Math.abs(circleS - swatch.s);
+      const lDiff = Math.abs(circleL - swatch.l);
+      
+      // Handle hue wrap-around (0 and 360 are the same)
+      const hDiffWrapped = Math.min(hDiff, 360 - hDiff);
+      
+      if (hDiffWrapped <= 10 && sDiff <= 2 && lDiff <= 2) {
+        return i;
+      }
+    }
+    return -1;
+  }, [palette]);
+
+  // Sync enabledSwatches array length when palette changes
+  useEffect(() => {
+    if (enabledSwatches.length !== palette.length) {
+      const newEnabled = new Array(palette.length).fill(true);
+      // Preserve existing enabled states where possible
+      for (let i = 0; i < Math.min(enabledSwatches.length, palette.length); i++) {
+        newEnabled[i] = enabledSwatches[i];
+      }
+      setEnabledSwatches(newEnabled);
+      enabledSwatchesRef.current = newEnabled;
+    }
+  }, [palette.length]);
 
   // Clear selection
   const clearSelection = useCallback(() => {
@@ -499,15 +582,13 @@ function App() {
     }
     
     // Draw selection highlights
-    if (selectedIds.size > 0) {
-      ctx.strokeStyle = 'rgba(0, 120, 255, 0.8)';
-      ctx.lineWidth = 2;
-      for (const c of circles) {
-        if (selectedIds.has(c.id)) {
-          ctx.beginPath();
-          ctx.arc(c.x, c.y, c.r + 3, 0, Math.PI * 2);
-          ctx.stroke();
-        }
+    if (selectedIds.size > 0) ctx.strokeStyle = 'rgba(0, 120, 255, 0.8)';
+    ctx.lineWidth = 2;
+    for (const c of circles) {
+      if (selectedIds.has(c.id)) {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, c.r + 3, 0, Math.PI * 2);
+        ctx.stroke();
       }
     }
     
@@ -652,10 +733,14 @@ function App() {
   const recolorSelection = useCallback(() => {
     for (const c of circles) {
       if (selectedIds.has(c.id) && isCircleModifiable(c)) {
-        c.color = getRandomPaletteColor();
+        const newColor = getRandomPaletteColor();
+        if (newColor) {
+          c.color = newColor;
+        }
       }
     }
   }, [circles, selectedIds, isCircleModifiable, getRandomPaletteColor]);
+
 
   // Invert selection - select unselected, deselect selected
   const invertSelection = useCallback(() => {
@@ -677,7 +762,7 @@ function App() {
 
   // Lock inverse - lock all circles that are NOT selected
   const lockInverse = useCallback(() => {
-    let lockedCount = 0;
+    let locked = 0;
     for (const c of circles) {
       // Skip if selected
       if (selectedIds.has(c.id)) continue;
@@ -688,21 +773,21 @@ function App() {
       if (!layer?.visible) continue;
       
       c.locked = true;
-      lockedCount++;
+      locked++;
     }
-    console.log(`Locked ${lockedCount} circles (inverse of selection)`);
+    console.log(`Locked ${locked} circles (inverse of selection)`);
   }, [circles, layers, selectedIds]);
 
   // Unlock all circles
   const unlockAll = useCallback(() => {
-    let unlockedCount = 0;
+    let unlocked = 0;
     for (const c of circles) {
       if (c.locked) {
         c.locked = false;
-        unlockedCount++;
+        unlocked++;
       }
     }
-    console.log(`Unlocked ${unlockedCount} circles`);
+    console.log(`Unlocked ${unlocked} circles`);
   }, [circles]);
 
   // Update undo/redo availability
@@ -998,14 +1083,10 @@ function App() {
   // Auto-spawn circles with random sizes
   const autoSpawnRandom = useCallback(() => {
     if (!isRandomSpawningRef.current) return;
-    
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
     const activeLayer = getActiveLayer();
     if (!activeLayer || activeLayer.type !== 'circles') return;
-    
-    // Try to place a few circles per frame
     for (let attempt = 0; attempt < 3; attempt++) {
       const x = Math.random() * canvas.width;
       const y = Math.random() * canvas.height;
@@ -1088,14 +1169,33 @@ function App() {
 
 
   // Exit application
-  const exitApplication = useCallback(() => {
-    if (window.__TAURI__) {
-      window.__TAURI__.window.getCurrent().close();
-    } else {
-      if (window.confirm('Close the application?')) {
-        window.close();
-      }
+  const exitApplication = useCallback(async (e?: React.MouseEvent) => {
+    if (e) {
+      e.preventDefault();
     }
+    
+    try {
+      // Try modern Tauri window API
+      const { getCurrent } = await import("@tauri-apps/api/window");
+      const current = getCurrent();
+      await current.close();
+      return;
+    } catch (err) {
+      console.warn("Tauri window API import failed:", err);
+    }
+
+    try {
+      // Fallback to legacy global
+      if (window.__TAURI__ && window.__TAURI__.window?.getCurrent) {
+        await window.__TAURI__.window.getCurrent().close();
+        return;
+      }
+    } catch (err) {
+      console.error("Failed to close via window.__TAURI__:", err);
+    }
+
+    // Final fallback: browser
+    alert("Cannot close window programmatically. Close the window manually.");
   }, []);
 
   const saveCurrentAnimation = useCallback(() => {
@@ -1594,9 +1694,14 @@ function App() {
       isRecoloringRef.current = true;
       recoloredThisStroke.current.clear();
       if (hit && isCircleModifiable(hit)) {
-        hit.color = getRandomPaletteColor();
-        recoloredThisStroke.current.add(hit.id);
-        console.log("recolored circle");
+        const newColor = getRandomPaletteColor();
+        if (newColor) {
+          hit.color = newColor;
+          recoloredThisStroke.current.add(hit.id);
+          console.log("recolored circle on click (active swatches)");
+        } else {
+          console.log("recolor aborted - no enabled swatches");
+        }
       }
       return;
     }
@@ -1748,9 +1853,14 @@ function App() {
     if (isRecoloringRef.current) {
       const hit = getCircleAt(x, y);
       if (hit && isCircleModifiable(hit) && !recoloredThisStroke.current.has(hit.id)) {
-        hit.color = getRandomPaletteColor();
-        recoloredThisStroke.current.add(hit.id);
-        console.log("recolored circle while dragging");
+        const newColor = getRandomPaletteColor();
+        if (newColor) {
+          hit.color = newColor;
+          recoloredThisStroke.current.add(hit.id);
+          console.log("recolored circle while dragging (active swatches)");
+        } else {
+          console.log("recolor aborted - no enabled swatches");
+        }
       }
       return;
     }
@@ -1767,12 +1877,6 @@ function App() {
         system.addFlowVector(lastFlowPosRef.current.x, lastFlowPosRef.current.y, angle);
         lastFlowPosRef.current = { x, y };
       }
-      return;
-    }
-    
-    // Flow field erase - remove vectors while dragging
-    if (flowMode === 'erase') {
-      system.removeFlowVectorAt(x, y);
       return;
     }
     
@@ -1882,7 +1986,7 @@ function App() {
     }
     isErasingRef.current = false;
     
-    // Clear lock state
+    // Clear lock mode state
     isLockingRef.current = false;
     
     // Clear recolor state
@@ -2345,6 +2449,7 @@ function App() {
                 selectedSwatch,
                 bgPalette,
                 selectedBgSwatch,
+                enabledSwatches,
                 projectName
               );
             }}
@@ -2406,6 +2511,17 @@ function App() {
               }
               if (data.selectedBgSwatch !== undefined) {
                 setSelectedBgSwatch(data.selectedBgSwatch);
+              }
+              
+              // Restore enabled swatches
+              if (data.enabledSwatches && Array.isArray(data.enabledSwatches)) {
+                setEnabledSwatches(data.enabledSwatches);
+                enabledSwatchesRef.current = data.enabledSwatches;
+              } else {
+                // Default to all enabled if not in saved data
+                const allEnabled = new Array(data.palette.length).fill(true);
+                setEnabledSwatches(allEnabled);
+                enabledSwatchesRef.current = allEnabled;
               }
               
               // Initialize undo history with loaded state
@@ -2510,15 +2626,32 @@ function App() {
 
         <h2>Color</h2>
 
+
         <div className="control-group">
+          <div className="swatch-controls">
+            <button onClick={enableAllSwatches} className="small">Enable All</button>
+            <button onClick={disableAllSwatches} className="small">Disable All</button>
+          </div>
           <div className="swatch-row">
             {palette.map((color, i) => (
-              <div
-                key={i}
-                className={`swatch ${selectedSwatch === i ? 'selected' : ''}`}
-                style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
-                onClick={() => setSelectedSwatch(i)}
-              />
+              <div key={i} className="swatch-container">
+                <div
+                  className={`swatch-toggle ${enabledSwatches[i] ? 'enabled' : 'disabled'}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSwatchEnabled(i);
+                  }}
+                  title={enabledSwatches[i] ? "Enabled for recoloring" : "Disabled for recoloring"}
+                >
+                  {enabledSwatches[i] ? '●' : '○'}
+                </div>
+                <div
+                  className={`swatch ${selectedSwatch === i ? 'selected' : ''} ${!enabledSwatches[i] ? 'swatch-disabled' : ''}`}
+                  style={{ background: `hsl(${color.h}, ${color.s}%, ${color.l}%)` }}
+                  onClick={() => setSelectedSwatch(i)}
+                  title={`Swatch ${i + 1}`}
+                />
+              </div>
             ))}
           </div>
         </div>
@@ -2582,6 +2715,25 @@ function App() {
           </button>
         </div>
 
+        {/* Color mode for drawing */}
+        <div className="control-group">
+          <div className="button-row">
+            <button
+              className={useRandomEnabledSwatches ? 'active' : ''}
+              onClick={() => setUseRandomEnabledSwatches(true)}
+              title="Draw circles using random colors from enabled swatches"
+            >
+              Random Enabled
+            </button>
+            <button
+              className={!useRandomEnabledSwatches ? 'active' : ''}
+              onClick={() => setUseRandomEnabledSwatches(false)}
+              title="Draw circles using only the selected swatch color"
+            >
+              Single Swatch
+            </button>
+          </div>
+        </div>
         
           </div>
 
@@ -2726,7 +2878,7 @@ function App() {
           </div>
 
           {/* PHYSICS TAB */}
-          <div className={`tab-pane ${leftTab === 'physics' ? 'active' : ''}`}> 
+          <div className={`tab-pane ${leftTab === 'physics' ? 'active' : ''}`}>
             <h2>Magnet</h2>
 
         <div className="control-group button-row">
@@ -2938,333 +3090,208 @@ function App() {
       </div>
     </aside>
 
-      {/* Canvas Area */}
-      <main className="canvas-container">
-        {isRecording && (
-          <div className="recording-indicator">
-            REC {(recordingDuration / 1000).toFixed(1)}s
+    {/* Canvas Area */}
+    <main className="canvas-container">
+      {isRecording && (
+        <div className="recording-indicator">REC {(recordingDuration / 1000).toFixed(1)}s</div>
+      )}
+      {isPlayingAnimation && (
+        <div className="playback-indicator">▶ Playing</div>
+      )}
+      {isExportingVideo && (
+        <div className="exporting-indicator">🎬 Exporting {exportResolution}x... {exportProgress?.progress || 0}%</div>
+      )}
+      <canvas
+        ref={canvasRef}
+        style={{ cursor: eraseMode ? 'not-allowed' : lockMode ? 'pointer' : recolorMode ? 'cell' : selectMode ? 'crosshair' : magnetMode !== 'off' ? 'move' : flowMode === 'draw' ? 'crosshair' : flowMode === 'erase' ? 'not-allowed' : 'crosshair' }}
+        onMouseDown={handlePointerDown}
+        onMouseMove={handlePointerMove}
+        onMouseUp={handlePointerUp}
+        onMouseLeave={handlePointerUp}
+        onTouchStart={handlePointerDown}
+        onTouchMove={handlePointerMove}
+        onTouchEnd={handlePointerUp}
+        onTouchCancel={handlePointerUp}
+      />
+    </main>
+
+    {/* Right Panel */}
+    <aside className="panel right-panel">
+      <div className="tab-nav">
+        <button className={`tab-button ${rightTab === 'effects' ? 'active' : ''}`} onClick={() => setRightTab('effects')}>Effects</button>
+        <button className={`tab-button ${rightTab === 'layers' ? 'active' : ''}`} onClick={() => setRightTab('layers')}>Layers</button>
+      </div>
+      <div className="tab-content">
+        <div className={`tab-pane ${rightTab === 'effects' ? 'active' : ''}`}>
+          <h2>Flow Field</h2>
+          <div className="control-group button-row">
+            <button onClick={() => { const newMode = flowMode === 'draw' ? 'off' : 'draw'; setFlowMode(newMode); if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); } }} className={flowMode === 'draw' ? 'active' : ''}>Draw</button>
+            <button onClick={() => { const newMode = flowMode === 'erase' ? 'off' : 'erase'; setFlowMode(newMode); if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); } }} className={flowMode === 'erase' ? 'active danger' : ''}>Erase</button>
           </div>
-        )}
-        {isPlayingAnimation && (
-          <div className="playback-indicator">
-            ▶ Playing
+          <div className="control-group">
+            <button onClick={() => setFlowVisible(!flowVisible)} className={flowVisible ? 'active' : ''}>Visible {flowVisible ? 'ON' : 'OFF'}</button>
           </div>
-        )}
-        {isExportingVideo && (
-          <div className="exporting-indicator">
-            🎬 Exporting {exportResolution}x... {exportProgress?.progress || 0}%
+          <div className="control-group">
+            <button onClick={() => system.clearFlowField()}>Clear All</button>
           </div>
-        )}
-        <canvas
-          ref={canvasRef}
-          style={{ cursor: eraseMode ? 'not-allowed' : lockMode ? 'pointer' : recolorMode ? 'cell' : selectMode ? 'crosshair' : magnetMode !== 'off' ? 'move' : flowMode === 'draw' ? 'crosshair' : flowMode === 'erase' ? 'not-allowed' : 'crosshair' }}
-          // Mouse events
-          onMouseDown={handlePointerDown}
-          onMouseMove={handlePointerMove}
-          onMouseUp={handlePointerUp}
-          onMouseLeave={handlePointerUp}
-          // Touch events
-          onTouchStart={handlePointerDown}
-          onTouchMove={handlePointerMove}
-          onTouchEnd={handlePointerUp}
-          onTouchCancel={handlePointerUp}
-        />
-      </main>
-
-      {/* Right Panel */}
-      <aside className="panel right-panel">
-        
-        {/* Tab Navigation */}
-        <div className="tab-nav">
-          <button 
-            className={`tab-button ${rightTab === 'effects' ? 'active' : ''}`}
-            onClick={() => setRightTab('effects')}
-          >
-            Effects
-          </button>
-          <button 
-            className={`tab-button ${rightTab === 'layers' ? 'active' : ''}`}
-            onClick={() => setRightTab('layers')}
-          >
-            Layers
-          </button>
-        </div>
-
-        {/* Tab Content */}
-        <div className="tab-content">
-          {/* EFFECTS TAB */}
-          <div className={`tab-pane ${rightTab === 'effects' ? 'active' : ''}`}>
-            <h2>Flow Field</h2>
-
-        <div className="control-group button-row">
-          <button
-            onClick={() => {
-              const newMode = flowMode === 'draw' ? 'off' : 'draw';
-              setFlowMode(newMode);
-              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
-            }}
-            className={flowMode === 'draw' ? "active" : ""}
-          >
-            Draw
-          </button>
-          <button
-            onClick={() => {
-              const newMode = flowMode === 'erase' ? 'off' : 'erase';
-              setFlowMode(newMode);
-              if (newMode !== 'off') { setEraseMode(false); setLockMode(false); setRecolorMode(false); setMagnetMode('off'); setSelectMode(false); clearSelection(); }
-            }}
-            className={flowMode === 'erase' ? "active danger" : ""}
-          >
-            Erase
-          </button>
-        </div>
-
-        <div className="control-group">
-          <button
-            onClick={() => setFlowVisible(!flowVisible)}
-            className={flowVisible ? "active" : ""}
-          >
-            Visible {flowVisible ? "ON" : "OFF"}
-          </button>
-        </div>
-
-        <div className="control-group">
-          <button onClick={() => system.clearFlowField()}>
-            Clear All
-          </button>
-        </div>
-
-        <div className="control-group">
-          <label>Strength: {flowStrength.toFixed(2)}</label>
-          <input
-            type="range"
-            min="0"
-            max="0.5"
-            step="0.01"
-            value={flowStrength}
-            onChange={(e) => setFlowStrength(Number(e.target.value))}
-          />
-        </div>
-
-        <div className="control-group">
-          <label>Radius: {flowRadius}</label>
-          <input
-            type="range"
-            min="50"
-            max="300"
-            value={flowRadius}
-            onChange={(e) => setFlowRadius(Number(e.target.value))}
-          />
-        </div>
-
-        <h2>Scale All</h2>
-        
-        <div className="control-group">
-          <label>Hold & drag to scale</label>
-          <div className="spring-slider">
-            <span className="slider-label">−</span>
-            <input
-              type="range"
-              min="-100"
-              max="100"
-              value={scaleSliderValue}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setScaleSliderValue(val);
-                scaleSliderRef.current = val / 100;
-              }}
-              onMouseDown={() => { isScalingRef.current = true; }}
-              onMouseUp={() => {
-                isScalingRef.current = false;
-                scaleSliderRef.current = 0;
-                setScaleSliderValue(0);
-              }}
-              onMouseLeave={() => {
-                if (isScalingRef.current) {
-                  isScalingRef.current = false;
-                  scaleSliderRef.current = 0;
-                  setScaleSliderValue(0);
-                }
-              }}
-              onTouchStart={() => { isScalingRef.current = true; }}
-              onTouchEnd={() => {
-                isScalingRef.current = false;
-                scaleSliderRef.current = 0;
-                setScaleSliderValue(0);
-              }}
-            />
-            <span className="slider-label">+</span>
+          <div className="control-group">
+            <label>Strength: {flowStrength.toFixed(2)}</label>
+            <input type="range" min="0" max="0.5" step="0.01" value={flowStrength} onChange={(e) => setFlowStrength(Number(e.target.value))} />
           </div>
-        </div>
-
-        <h2>Random Scale</h2>
-        
-        <div className="control-group">
-          <label>Hold & drag to randomize</label>
-          <div className="spring-slider">
-            <span className="slider-label">−</span>
-            <input
-              type="range"
-              min="-100"
-              max="100"
-              value={randomScaleSliderValue}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setRandomScaleSliderValue(val);
-                randomScaleSliderRef.current = val / 100;
-              }}
-              onMouseDown={() => { isRandomScalingRef.current = true; }}
-              onMouseUp={() => {
-                isRandomScalingRef.current = false;
-                randomScaleSliderRef.current = 0;
-                setRandomScaleSliderValue(0);
-              }}
-              onMouseLeave={() => {
-                if (isRandomScalingRef.current) {
-                  isRandomScalingRef.current = false;
-                  randomScaleSliderRef.current = 0;
-                  setRandomScaleSliderValue(0);
-                }
-              }}
-              onTouchStart={() => { isRandomScalingRef.current = true; }}
-              onTouchEnd={() => {
-                isRandomScalingRef.current = false;
-                randomScaleSliderRef.current = 0;
-                setRandomScaleSliderValue(0);
-              }}
-            />
-            <span className="slider-label">+</span>
-          </div>
-        </div>
-
-        
+          <div className="control-group">
+            <label>Radius: {flowRadius}</label>
+            <input type="range" min="50" max="300" value={flowRadius} onChange={(e) => setFlowRadius(Number(e.target.value))} />
           </div>
 
-          {/* LAYERS TAB */}
-          <div className={`tab-pane ${rightTab === 'layers' ? 'active' : ''}`}>
-            <h2>Layers</h2>
-        
-        <div className="control-group button-row">
-          <button onClick={() => addCircleLayer()}>+ Circles</button>
-          <button onClick={() => addPaintLayer()}>+ Paint</button>
-        </div>
-        
-        <div className="layer-list">
-          {[...layers].reverse().map((layer) => (
-            <div 
-              key={layer.id}
-              className={`layer-item ${layer.id === activeLayerId ? 'active' : ''}`}
-              onClick={() => setActiveLayerId(layer.id)}
-            >
-              <div className="layer-info">
-                <span className="layer-type">{layer.type === 'circles' ? '●' : '◐'}</span>
-                <span className="layer-name">{layer.name}</span>
-              </div>
-              <div className="layer-controls">
-                <button 
-                  className={`layer-btn ${layer.visible ? '' : 'off'}`}
-                  onClick={(e) => { e.stopPropagation(); toggleVisibility(layer.id); }}
-                  title="Toggle visibility"
-                >
-                  {layer.visible ? '👁' : '○'}
-                </button>
-                <button 
-                  className={`layer-btn ${layer.locked ? 'on' : ''}`}
-                  onClick={(e) => { e.stopPropagation(); toggleLock(layer.id); }}
-                  title="Toggle lock"
-                >
-                  {layer.locked ? '🔒' : '○'}
-                </button>
-                <button 
-                  className="layer-btn"
-                  onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }}
-                  title="Move up"
-                >
-                  ↑
-                </button>
-                <button 
-                  className="layer-btn"
-                  onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'down'); }}
-                  title="Move down"
-                >
-                  ↓
-                </button>
-                {layers.length > 1 && (
-                  <button 
-                    className="layer-btn danger"
-                    onClick={(e) => { e.stopPropagation(); removeLayer(layer.id); }}
-                    title="Delete layer"
-                  >
-                    ×
-                  </button>
-                )}
-              </div>
-              <div className="layer-opacity" onClick={(e) => e.stopPropagation()}>
-                <span className="opacity-label">α</span>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={layer.opacity}
-                  onChange={(e) => updateLayer(layer.id, { opacity: Number(e.target.value) })}
-                  title={`Opacity: ${Math.round(layer.opacity * 100)}%`}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-        
-        {getActiveLayer()?.type === 'paint' && (
-          <>
-            <h3>Paint Settings</h3>
-            <div className="control-group">
-              <button
-                onClick={() => setPaintMode(!paintMode)}
-                className={paintMode ? "active" : ""}
-              >
-                Paint {paintMode ? "ON" : "OFF"}
-              </button>
-            </div>
-            <div className="control-group">
-              <label>Wetness: {brush.getSettings().wetness.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={brush.getSettings().wetness}
-                onChange={(e) => brush.setSettings({ wetness: Number(e.target.value) })}
+          <h2>Scale All</h2>
+          <div className="control-group">
+            <label>Hold & drag to scale</label>
+            <div className="spring-slider">
+              <span className="slider-label">−</span>
+              <input 
+                type="range" 
+                min="-100" 
+                max="100" 
+                value={scaleSliderValue} 
+                onChange={(e) => { 
+                  const val = Number(e.target.value); 
+                  setScaleSliderValue(val); 
+                  scaleSliderRef.current = val / 100; 
+                }} 
+                onInput={(e) => { 
+                  const val = Number((e.target as HTMLInputElement).value); 
+                  setScaleSliderValue(val); 
+                  scaleSliderRef.current = val / 100; 
+                }} 
+                onMouseDown={() => { 
+                  isScalingRef.current = true; 
+                }} 
+                onMouseUp={() => { 
+                  isScalingRef.current = false; 
+                  setScaleSliderValue(0); 
+                  scaleSliderRef.current = 0; 
+                }} 
+                onMouseLeave={() => { 
+                  if (isScalingRef.current) { 
+                    isScalingRef.current = false; 
+                    setScaleSliderValue(0); 
+                    scaleSliderRef.current = 0; 
+                  } 
+                }} 
+                onTouchStart={() => { 
+                  isScalingRef.current = true; 
+                }} 
+                onTouchEnd={() => { 
+                  isScalingRef.current = false; 
+                  setScaleSliderValue(0); 
+                  scaleSliderRef.current = 0; 
+                }} 
               />
+              <span className="slider-label">+</span>
             </div>
-            <div className="control-group">
-              <label>Flow: {brush.getSettings().flow.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0.1"
-                max="1"
-                step="0.05"
-                value={brush.getSettings().flow}
-                onChange={(e) => brush.setSettings({ flow: Number(e.target.value) })}
+          </div>
+
+          <h2>Random Scale</h2>
+          <div className="control-group">
+            <label>Hold & drag to randomize</label>
+            <div className="spring-slider">
+              <span className="slider-label">−</span>
+              <input 
+                type="range" 
+                min="-100" 
+                max="100" 
+                value={randomScaleSliderValue} 
+                onChange={(e) => { 
+                  const val = Number(e.target.value); 
+                  setRandomScaleSliderValue(val); 
+                  randomScaleSliderRef.current = val / 100; 
+                }} 
+                onInput={(e) => { 
+                  const val = Number((e.target as HTMLInputElement).value); 
+                  setRandomScaleSliderValue(val); 
+                  randomScaleSliderRef.current = val / 100; 
+                }} 
+                onMouseDown={() => { 
+                  isRandomScalingRef.current = true; 
+                }} 
+                onMouseUp={() => { 
+                  isRandomScalingRef.current = false; 
+                  setRandomScaleSliderValue(0); 
+                  randomScaleSliderRef.current = 0; 
+                }} 
+                onMouseLeave={() => { 
+                  if (isRandomScalingRef.current) { 
+                    isRandomScalingRef.current = false; 
+                    setRandomScaleSliderValue(0); 
+                    randomScaleSliderRef.current = 0; 
+                  } 
+                }} 
+                onTouchStart={() => { 
+                  isRandomScalingRef.current = true; 
+                }} 
+                onTouchEnd={() => { 
+                  isRandomScalingRef.current = false; 
+                  setRandomScaleSliderValue(0); 
+                  randomScaleSliderRef.current = 0; 
+                }} 
               />
+              <span className="slider-label">+</span>
             </div>
-            <div className="control-group">
-              <label>Bleed: {brush.getSettings().bleedStrength.toFixed(2)}</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={brush.getSettings().bleedStrength}
-                onChange={(e) => brush.setSettings({ bleedStrength: Number(e.target.value) })}
-              />
-            </div>
-            <div className="control-group">
-              <button onClick={() => clearPaintLayer(activeLayerId)}>Clear Paint</button>
-            </div>
-          </>
-        )}
-      
+          </div>
+        </div>
+
+        <div className={`tab-pane ${rightTab === 'layers' ? 'active' : ''}`}>
+          <h2>Layers</h2>
+          <div className="control-group button-row">
+            <button onClick={() => addCircleLayer()}>+ Circles</button>
+            <button onClick={() => addPaintLayer()}>+ Paint</button>
+          </div>
+          <div className="layer-list">
+            {[...layers].reverse().map((layer) => (
+              <div key={layer.id} className={`layer-item ${layer.id === activeLayerId ? 'active' : ''}`} onClick={() => setActiveLayerId(layer.id)}>
+                <div className="layer-info">
+                  <span className="layer-type">{layer.type === 'circles' ? '●' : '◐'}</span>
+                  <span className="layer-name">{layer.name}</span>
+                </div>
+                <div className="layer-controls">
+                  <button className={`layer-btn ${layer.visible ? '' : 'off'}`} onClick={(e) => { e.stopPropagation(); toggleVisibility(layer.id); }} title="Toggle visibility">{layer.visible ? '👁' : '○'}</button>
+                  <button className={`layer-btn ${layer.locked ? 'on' : ''}`} onClick={(e) => { e.stopPropagation(); toggleLock(layer.id); }} title="Toggle lock">{layer.locked ? '🔒' : '○'}</button>
+                  <button className="layer-btn" onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }} title="Move up">↑</button>
+                  <button className="layer-btn" onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'down'); }} title="Move down">↓</button>
+                  {layers.length > 1 && (
+                    <button className="layer-btn danger" onClick={(e) => { e.stopPropagation(); removeLayer(layer.id); }} title="Delete layer">×</button>
+                  )}
+                </div>
+                <div className="layer-opacity" onClick={(e) => e.stopPropagation()}>
+                  <span className="opacity-label">α</span>
+                  <input type="range" min="0" max="1" step="0.05" value={layer.opacity} onChange={(e) => updateLayer(layer.id, { opacity: Number(e.target.value) })} title={`Opacity: ${Math.round(layer.opacity * 100)}%`} />
+                </div>
+              </div>
+            ))}
+          </div>
+          {getActiveLayer()?.type === 'paint' && (
+            <>
+              <h3>Paint Settings</h3>
+              <div className="control-group">
+                <button onClick={() => setPaintMode(!paintMode)} className={paintMode ? 'active' : ''}>Paint {paintMode ? 'ON' : 'OFF'}</button>
+              </div>
+              <div className="control-group">
+                <label>Wetness: {brush.getSettings().wetness.toFixed(2)}</label>
+                <input type="range" min="0" max="1" step="0.05" value={brush.getSettings().wetness} onChange={(e) => brush.setSettings({ wetness: Number(e.target.value) })} />
+              </div>
+              <div className="control-group">
+                <label>Flow: {brush.getSettings().flow.toFixed(2)}</label>
+                <input type="range" min="0.1" max="1" step="0.05" value={brush.getSettings().flow} onChange={(e) => brush.setSettings({ flow: Number(e.target.value) })} />
+              </div>
+              <div className="control-group">
+                <label>Bleed: {brush.getSettings().bleedStrength.toFixed(2)}</label>
+                <input type="range" min="0" max="1" step="0.05" value={brush.getSettings().bleedStrength} onChange={(e) => brush.setSettings({ bleedStrength: Number(e.target.value) })} />
+              </div>
+              <div className="control-group">
+                <button onClick={() => clearPaintLayer(activeLayerId)}>Clear Paint</button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </aside>

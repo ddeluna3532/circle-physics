@@ -41,6 +41,7 @@ export interface ProjectData {
   // Color palette
   palette: { h: number; s: number; l: number }[];
   selectedSwatch: number;
+  enabledSwatches?: boolean[]; // Add enabled swatches
   
   // Background palette
   bgPalette?: { h: number; s: number; l: number }[];
@@ -130,6 +131,7 @@ export function saveProject(
   selectedSwatch: number,
   bgPalette: ProjectData['bgPalette'],
   selectedBgSwatch: number,
+  enabledSwatches: boolean[],
   projectName: string = 'untitled'
 ): void {
   const project: ProjectData = {
@@ -146,6 +148,7 @@ export function saveProject(
     selectedSwatch,
     bgPalette,
     selectedBgSwatch,
+    enabledSwatches,
   };
   
   const json = JSON.stringify(project, null, 2);
